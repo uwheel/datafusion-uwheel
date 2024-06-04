@@ -1,0 +1,9 @@
+[package]
+name = "wheel_manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uwheel = "0.1"
+datafusion = "38.0.0"
+chrono = "0.4.38"
