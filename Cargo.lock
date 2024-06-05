@@ -2258,6 +2258,7 @@ version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6c4da4dc285f7ec8925915ed563f48ba6a70814981cbef71bbb62e2087c38f9"
 dependencies = [
+ "parking_lot",
  "serde",
  "smallvec",
  "time",

@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-uwheel = "0.1"
+uwheel = { version = "0.1", features = ["sync"] }
 datafusion = "38.0.0"
 chrono = "0.4.38"
