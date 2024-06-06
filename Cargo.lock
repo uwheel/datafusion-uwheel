@@ -2351,7 +2351,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wheel_manager"
+name = "wheel-manager"
 version = "0.1.0"
 dependencies = [
  "chrono",

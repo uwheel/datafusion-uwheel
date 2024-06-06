@@ -5,7 +5,7 @@ use wheel_manager::{MinMaxAggregator, MinMaxState, WheelManager};
 fn main() {
     // Build a WheelManager over parquet files in /data using the time column "tpep_dropoff_datetime"
     let manager: WheelManager = wheel_manager::Builder::new("data/", "tpep_dropoff_datetime")
-        .with_min_max_wheels(vec!["fare_amount", "trip_distance"]) // Build Min/Max wheels for the columns "fare_amount" and "trip_distance"
+        .with_min_max_wheels(vec!["fare_amount", "trip_distance"]) // Create Min/Max wheels for the columns "fare_amount" and "trip_distance"
         .build()
         .unwrap();
 
@@ -18,16 +18,7 @@ fn main() {
     // WHERE tpep_dropoff_datetime >= '?' and < '?'
     let count_wheel = manager.count_wheel();
 
-    let watermark = count_wheel.watermark();
-    println!("Landmark COUNT(*) {:?}", count_wheel.as_ref().landmark());
-
-    let watermark = DateTime::from_timestamp_millis(watermark as i64)
-        .unwrap()
-        .to_utc()
-        .naive_utc()
-        .to_string();
-
-    println!("WATERMARK: {:?}", watermark);
+    println!("Landmark COUNT(*) {:?}", count_wheel.landmark());
 
     // The following wheel can be used to quickly filter queries such as:
     // SELECT * FROM yellow_tripdata
@@ -43,6 +34,7 @@ fn main() {
     let end_date = Utc.from_utc_datetime(&end.and_hms_opt(0, 0, 0).unwrap());
 
     // Whether there are fare amounts above 1000.0
+    // DataFusion Expr: let expr = col("fare_amount").gt(lit(1000.0));
     let fare_pred = |min_max_state: MinMaxState| min_max_state.max_value() > 1000.0;
 
     // Check whether the filter between 2022-01-01  and 2022-01-10 can be skipped

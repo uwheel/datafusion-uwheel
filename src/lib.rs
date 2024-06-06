@@ -27,6 +27,7 @@ pub mod min_max;
 pub use min_max::{MinMaxAggregator, MinMaxState};
 
 /// Builder for creating a WheelManager
+#[allow(dead_code)]
 pub struct Builder {
     /// Directory where the raw parquet files are stored
     dir: PathBuf,
@@ -36,8 +37,6 @@ pub struct Builder {
     min_max_columns: Vec<String>,
     /// Default Haw configuration to use when building wheels
     wheel_conf: HawConf,
-    /// Pre-defined filters to apply to the parquet files to build wheels
-    filters: Vec<Expr>,
 }
 
 impl Builder {
@@ -46,7 +45,6 @@ impl Builder {
         Self {
             dir: dir.into(),
             time_column: time_column.into(),
-            filters: Default::default(),
             min_max_columns: Default::default(),
             wheel_conf: HawConf::default(),
         }
@@ -59,11 +57,6 @@ impl Builder {
         self.min_max_columns = columns.iter().map(|s| s.to_string()).collect();
         self
     }
-    /// Pre-defined filters to apply to the parquet files
-    pub fn with_filters(mut self, filters: Vec<Expr>) -> Self {
-        self.filters = filters;
-        self
-    }
     pub fn build(self) -> Result<WheelManager> {
         WheelManager::try_new(self.dir, self.time_column, self.min_max_columns)
     }
@@ -72,6 +65,7 @@ impl Builder {
 /// A Wheel Manager over a set of parquet files
 ///
 /// An extension that improves time-based analytical queries.
+#[allow(dead_code)]
 pub struct WheelManager {
     /// The column in the parquet files that contains the time
     time_column: String,
@@ -79,7 +73,7 @@ pub struct WheelManager {
     dir: PathBuf,
     /// A COUNT(*) wheel over the parquet files and time column
     count: ReaderWheel<U32SumAggregator>,
-    // Min/Max pruning wheels over the parquet files for a specific column
+    /// Min/Max pruning wheels over the parquet files for a specific column
     min_max_wheels: Arc<Mutex<HashMap<String, ReaderWheel<MinMaxAggregator>>>>,
 }
 
@@ -123,6 +117,13 @@ impl WheelManager {
     /// Returns a reference to a MIN/MAX wheel for a specified column
     pub fn min_max_wheel(&self, column: &str) -> Option<ReaderWheel<MinMaxAggregator>> {
         self.min_max_wheels.lock().unwrap().get(column).cloned()
+    }
+
+    /// Builds a wheel for the given DataFusion expression
+    ///
+    /// Example: `col("PULocationID").eq(lit(120))`
+    pub fn build_wheel(&self, _expr: Expr) {
+        todo!("Not implemented yet");
     }
 }
 
@@ -260,6 +261,7 @@ fn build_min_max_wheel(
                     wheel.insert(entry);
                 }
             }
+            // Once all data is inserted, advance the wheel to the max timestamp
             wheel.advance_to(max_timestamp_ms);
         } else {
             panic!("Min/Max column must be a numeric type");
@@ -328,7 +330,7 @@ fn build_count_wheel(timestamps: Vec<i64>) -> (RwWheel<U32SumAggregator>, u64, u
     (count_wheel, min_ms, max_ms)
 }
 
-/// Return a list of the directory entries in the given directory, sorted by name
+/// Return a list of the directory entries in the given directory, sorted by name (taken from parquet_index_example.rs)
 fn read_dir(dir: &Path) -> Result<Vec<DirEntry>> {
     let mut files = dir
         .read_dir()
