@@ -107,14 +107,14 @@ async fn main() -> Result<()> {
     println!("===== MINUTE RANGES =====");
     let min_ranges = generate_minute_time_ranges(start_date, end_date, args.queries);
 
-    bench_fare_datafusion("datafusion", &ctx, &min_ranges).await;
-    bench_fare_datafusion("datafusion-uwheel", &uwheel_ctx, &min_ranges).await;
+    bench_datafusion_count("datafusion", &ctx, &min_ranges).await;
+    bench_datafusion_count("datafusion-uwheel", &uwheel_ctx, &min_ranges).await;
 
     println!("===== HOUR RANGES =====");
 
     let hr_ranges = generate_hour_time_ranges(start_date, end_date, args.queries);
-    bench_fare_datafusion("datafusion", &ctx, &hr_ranges).await;
-    bench_fare_datafusion("datafusion-uwheel", &uwheel_ctx, &hr_ranges).await;
+    bench_datafusion_count("datafusion", &ctx, &hr_ranges).await;
+    bench_datafusion_count("datafusion-uwheel", &uwheel_ctx, &hr_ranges).await;
 
     Ok(())
 }
@@ -171,7 +171,7 @@ pub fn generate_hour_time_ranges(
     ranges
 }
 
-async fn bench_fare_datafusion(id: &str, ctx: &SessionContext, ranges: &[(u64, u64)]) {
+async fn bench_datafusion_count(id: &str, ctx: &SessionContext, ranges: &[(u64, u64)]) {
     let queries: Vec<_> = ranges
         .iter()
         .copied()
