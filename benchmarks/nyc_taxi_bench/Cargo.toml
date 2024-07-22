@@ -1,0 +1,19 @@
+[package]
+name = "nyc_taxi_bench"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+debug = []
+
+[dependencies]
+datafusion-uwheel = { path = "../../datafusion-uwheel" }
+datafusion = "38.0.0"
+mimalloc = { version = "*", default-features = false, optional = true }
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4.38"
+minstant = "0.1.7"
+fastrand = "2.1.0"
+hdrhistogram = "7"
+clap = { version = "3.2", features = ["derive"] }
+human_bytes = "0.4"

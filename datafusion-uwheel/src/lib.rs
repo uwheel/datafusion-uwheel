@@ -27,10 +27,8 @@ use datafusion::{
 };
 use exec::UWheelCountExec;
 use uwheel::{
-    aggregator::min_max::F64MinMaxAggregator,
-    aggregator::sum::U32SumAggregator,
-    wheels::read::{aggregation::conf::WheelMode, ReaderWheel},
-    Conf, Entry, HawConf, RwWheel, WheelRange,
+    aggregator::min_max::F64MinMaxAggregator, aggregator::sum::U32SumAggregator,
+    wheels::read::ReaderWheel, Conf, Entry, HawConf, RwWheel, WheelRange,
 };
 
 /// Custom aggregator implementations that are used by this crate.
@@ -42,38 +40,38 @@ pub mod exec;
 
 pub const COUNT_STAR_ALIAS: &str = "COUNT(*)";
 
-/// A µWheel Provider over a set of parquet files
-///
-/// An extension that improves time-based analytical queries.
+/// A µWheel optimizer for DataFusion that indexes wheels for time-based analytical queries.
 #[allow(dead_code)]
 pub struct UWheelOptimizer {
     /// Name of the table
     name: String,
     /// The column in the parquet files that contains the time
     time_column: String,
-    /// A COUNT(*) wheel over the parquet files and time column
+    /// A COUNT(*) wheel over the underlying table data and time column
     count: ReaderWheel<U32SumAggregator>,
     /// Min/Max pruning wheels over the parquet files for a specific column
     min_max_wheels: Arc<Mutex<HashMap<String, ReaderWheel<F64MinMaxAggregator>>>>,
     // TODO: add support for other aggregation wheels
     // aggregation_wheels: Arc<Mutex<HashMap<Expr, ReaderWheel<?>>>>,
-    /// Table provider which uwheel indexes are built on top of.
+    /// Table provider which UWheelOptimizer builds indexes on top of
     inner_provider: Arc<dyn TableProvider>,
+    haw_conf: HawConf,
 }
 
 impl UWheelOptimizer {
     /// Create a new UWheelOptimizer
-    pub async fn try_new(
+    async fn try_new(
         name: impl Into<String>,
         time_column: impl Into<String>,
         min_max_columns: Vec<String>,
         provider: Arc<dyn TableProvider>,
+        haw_conf: HawConf,
     ) -> Result<Self> {
         let time_column = time_column.into();
 
-        // Create an "initial" provider over the parquet files
+        // Create an initial instance of the UWheelOptimizer
         let (count, min_max_wheels) =
-            build(provider.clone(), &time_column, min_max_columns).await?;
+            build(provider.clone(), &time_column, min_max_columns, &haw_conf).await?;
 
         Ok(Self {
             name: name.into(),
@@ -81,6 +79,7 @@ impl UWheelOptimizer {
             count,
             min_max_wheels: Arc::new(Mutex::new(min_max_wheels)),
             inner_provider: provider,
+            haw_conf,
         })
     }
 
@@ -138,31 +137,31 @@ impl UWheelOptimizer {
                         if agg.group_expr.is_empty() && agg.aggr_expr.len() == 1 {
                             let agg_expr = agg.aggr_expr.first().unwrap();
                             match agg_expr {
-                                Expr::Alias(alias) => {
-                                    if alias.name == COUNT_STAR_ALIAS {
-                                        //dbg!(&alias.expr);
-                                        // Extract Wheel Range for temporal filter
-                                        if let Some((Some(start), Some(end))) = extract_wheel_range(
-                                            &filter.predicate,
-                                            &self.time_column,
-                                        ) {
-                                            let range =
-                                                WheelRange::new_unchecked(start as u64, end as u64);
-                                            // TODO: check if the range is queryable otherwise return None
-                                            //let result = self.count(range).unwrap_or(0) as u32;
-                                            return Some(self.count_exec(range));
-                                            //return Some(self.count_exec_plan(result).unwrap());
-                                        }
+                                // COUNT(*)
+                                Expr::Alias(alias) if alias.name == COUNT_STAR_ALIAS => {
+                                    // Extract Wheel Range for temporal filter
+                                    if let Some((Some(start), Some(end))) =
+                                        extract_wheel_range(&filter.predicate, &self.time_column)
+                                    {
+                                        // TODO: check if the range is queryable otherwise return None
+                                        let range =
+                                            WheelRange::new_unchecked(start as u64, end as u64);
+                                        return Some(self.count_exec(range));
                                     }
                                 }
-                                Expr::AggregateFunction(agg) => {
-                                    if matches!(
-                                        agg.func_def,
-                                        AggregateFunctionDefinition::BuiltIn(
-                                            AggregateFunction::Count
-                                        )
-                                    ) {
-                                        dbg!(agg);
+                                // SUM(col)
+                                Expr::AggregateFunction(agg)
+                                    if agg.args.len() == 1
+                                        && matches!(
+                                            agg.func_def,
+                                            AggregateFunctionDefinition::BuiltIn(
+                                                AggregateFunction::Sum
+                                            )
+                                        ) =>
+                                {
+                                    if let Expr::Column(col) = &agg.args[0] {
+                                        dbg!(col);
+                                        // TODO: Check whether name and relation fit any wheel
                                     }
                                 }
                                 _ => (),
@@ -186,13 +185,13 @@ impl QueryPlanner for UWheelOptimizer {
         logical_plan: &LogicalPlan,
         state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // TODO: Check whether this plan is for provider.name()
+        // If the optimization fails, use the default physical planner
         match self.try_optimize(&logical_plan) {
             Some(exec) => Ok(exec),
             None => {
-                // If the optimization fails, use the default physical planner
-                let planner = DefaultPhysicalPlanner::default();
-                planner.create_physical_plan(logical_plan, state).await
+                DefaultPhysicalPlanner::default()
+                    .create_physical_plan(logical_plan, state)
+                    .await
             }
         }
     }
@@ -205,6 +204,7 @@ async fn build(
     provider: Arc<dyn TableProvider>,
     time_column: &str,
     min_max_columns: Vec<String>,
+    haw_conf: &HawConf,
 ) -> Result<(
     ReaderWheel<U32SumAggregator>,
     HashMap<String, ReaderWheel<F64MinMaxAggregator>>,
@@ -236,7 +236,7 @@ async fn build(
     }
 
     // Build a COUNT(*) wheel over the timestamps
-    let (count_wheel, min_timestamp_ms, max_timestamp_ms) = build_count_wheel(timestamps);
+    let (count_wheel, min_timestamp_ms, max_timestamp_ms) = build_count_wheel(timestamps, haw_conf);
 
     // Build MinMax wheels for specified columns
     let mut map = HashMap::new();
@@ -248,6 +248,7 @@ async fn build(
             max_timestamp_ms,
             time_column,
             column,
+            &haw_conf,
         )
         .await?;
         map.insert(column.to_string(), min_max_wheel);
@@ -263,28 +264,14 @@ async fn build_min_max_wheel(
     max_timestamp_ms: u64,
     time_col: &str,
     min_max_col: &str,
+    haw_conf: &HawConf,
 ) -> Result<ReaderWheel<F64MinMaxAggregator>> {
     // TODO: remove hardcoded time
     let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
     let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
     let start_ms = date.timestamp_millis() as u64;
 
-    // TODO: get Conf from builder
-    let mut conf = HawConf::default()
-        .with_watermark(start_ms)
-        .with_mode(WheelMode::Index);
-
-    conf.minutes
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
-
-    conf.hours
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
-
-    conf.days
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
-
-    conf.weeks
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
+    let conf = haw_conf.clone().with_watermark(start_ms);
 
     let mut wheel: RwWheel<F64MinMaxAggregator> = RwWheel::with_conf(
         Conf::default()
@@ -337,7 +324,10 @@ async fn build_min_max_wheel(
 /// Builds a COUNT(*) wheel over the given timestamps
 ///
 /// Uses a U32SumAggregator internally with prefix-sum optimization
-fn build_count_wheel(timestamps: Vec<i64>) -> (RwWheel<U32SumAggregator>, u64, u64) {
+fn build_count_wheel(
+    timestamps: Vec<i64>,
+    haw_conf: &HawConf,
+) -> (RwWheel<U32SumAggregator>, u64, u64) {
     let min = timestamps.iter().min().copied().unwrap();
     let max = timestamps.iter().max().copied().unwrap();
 
@@ -353,21 +343,7 @@ fn build_count_wheel(timestamps: Vec<i64>) -> (RwWheel<U32SumAggregator>, u64, u
     let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
     let start_ms = date.timestamp_millis() as u64;
 
-    let mut conf = HawConf::default()
-        .with_watermark(start_ms)
-        .with_mode(WheelMode::Index);
-
-    conf.minutes
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
-
-    conf.hours
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
-
-    conf.days
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
-
-    conf.weeks
-        .set_retention_policy(uwheel::RetentionPolicy::Keep);
+    let conf = haw_conf.clone().with_watermark(start_ms);
 
     let mut count_wheel: RwWheel<U32SumAggregator> = RwWheel::with_conf(
         Conf::default()
@@ -383,7 +359,7 @@ fn build_count_wheel(timestamps: Vec<i64>) -> (RwWheel<U32SumAggregator>, u64, u
         let entry = Entry::new(1, timestamp_ms);
         count_wheel.insert(entry);
     }
-    dbg!(start_ms, max_ms);
+    //dbg!(start_ms, max_ms);
 
     count_wheel.advance_to(max_ms);
 
@@ -421,7 +397,7 @@ fn extract_wheel_range(predicate: &Expr, time_column: &str) -> Option<(Option<i6
             if let Operator::And = op {
                 let left = extract_wheel_range(left, time_column);
                 let right = extract_wheel_range(right, time_column);
-                dbg!(left, right);
+                //dbg!(left, right);
 
                 if let Some((start, _)) = left {
                     if let Some((_, end)) = right {

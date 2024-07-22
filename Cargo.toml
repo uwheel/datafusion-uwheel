@@ -1,9 +1,15 @@
-[package]
-name = "wheel-manager"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["benchmarks/nyc_taxi_bench", "datafusion-uwheel"]
 
-[dependencies]
+[workspace.package]
+version = "38.0.0"
+edition = "2021"
+authors = ["Max Meldrum <max@meldrum.se>"]
+license = "Apache-2.0"
+readme = "README.md"
+
+[workspace.dependencies]
 uwheel = { version = "0.2.0", default-features = false, features = [
     "sync",
     "min_max",
@@ -15,7 +21,3 @@ chrono = "0.4.38"
 bitpacking = "0.9.2"
 tokio = "1.38.1"
 futures = "0.3.30"
-
-
-[dev-dependencies]
-clap = { version = "3.2", features = ["derive"] }

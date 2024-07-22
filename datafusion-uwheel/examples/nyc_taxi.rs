@@ -11,17 +11,17 @@ use datafusion::{
     physical_plan::{aggregates::AggregateExec, collect},
     prelude::SessionContext,
 };
+use datafusion_uwheel::{builder::Builder, exec::UWheelCountExec, UWheelOptimizer};
 use uwheel::{
     aggregator::min_max::{F64MinMaxAggregator, MinMaxState},
     wheels::read::ReaderWheel,
     WheelRange,
 };
-use wheel_manager::{exec::UWheelCountExec, UWheelOptimizer};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let ctx = SessionContext::new();
-    let table_path = "data/";
+    let table_path = "../data/";
 
     // Parse the path
     let table_path = ListingTableUrl::parse(table_path)?;
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     // Build a provider over parquet files in data/ using the time column "tpep_dropoff_datetime"
     let optimizer: Arc<UWheelOptimizer> = Arc::new(
-        wheel_manager::builder::Builder::new("tpep_dropoff_datetime")
+        Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
             .with_min_max_wheels(vec!["fare_amount", "trip_distance"]) // Create Min/Max wheels for the columns "fare_amount" and "trip_distance"
             .build_with_provider(provider)

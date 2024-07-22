@@ -1,6 +1,6 @@
-# Wheel Manager
+# datafusion-uwheel
 
-Early prototype of a wheel manager for DataFusion.
+This is an early prototype of an µWheel optimizer for DataFusion. The motivation behind this work is based on the following [post](https://uwheel.rs/post/datafusion/).
 
 
 ```bash
