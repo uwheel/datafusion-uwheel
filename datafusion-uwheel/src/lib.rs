@@ -5,7 +5,6 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use datafusion::error::Result;
 use datafusion::{
     arrow::{
         array::{Float64Array, RecordBatch, TimestampMicrosecondArray},
@@ -17,18 +16,23 @@ use datafusion::{
         TaskContext,
     },
     logical_expr::{
-        expr::AggregateFunctionDefinition, AggregateFunction, Between, BinaryExpr, LogicalPlan,
-        Operator,
+        expr::AggregateFunctionDefinition, AggregateFunction, Filter, LogicalPlan, Operator,
     },
-    physical_plan::{common::collect, ExecutionPlan},
+    physical_plan::{common::collect, empty::EmptyExec, ExecutionPlan},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::*,
     scalar::ScalarValue,
 };
-use exec::UWheelCountExec;
+use datafusion::{error::Result, logical_expr::Aggregate};
+use exec::{UWheelCountExec, UWheelSumExec};
+use expr::{extract_uwheel_expr, extract_wheel_range, MinMaxFilter, UWheelExpr};
 use uwheel::{
-    aggregator::min_max::F64MinMaxAggregator, aggregator::sum::U32SumAggregator,
-    wheels::read::ReaderWheel, Conf, Entry, HawConf, RwWheel, WheelRange,
+    aggregator::{
+        min_max::{F64MinMaxAggregator, MinMaxState},
+        sum::{F64SumAggregator, U32SumAggregator},
+    },
+    wheels::read::ReaderWheel,
+    Conf, Entry, HawConf, RwWheel, WheelRange,
 };
 
 /// Custom aggregator implementations that are used by this crate.
@@ -37,6 +41,8 @@ mod aggregator;
 pub mod builder;
 /// Various Execution Plan implementations
 pub mod exec;
+/// Various expressions that the optimizer supports
+mod expr;
 
 pub const COUNT_STAR_ALIAS: &str = "COUNT(*)";
 
@@ -45,16 +51,18 @@ pub const COUNT_STAR_ALIAS: &str = "COUNT(*)";
 pub struct UWheelOptimizer {
     /// Name of the table
     name: String,
-    /// The column in the parquet files that contains the time
+    /// The column that contains the time
     time_column: String,
     /// A COUNT(*) wheel over the underlying table data and time column
     count: ReaderWheel<U32SumAggregator>,
-    /// Min/Max pruning wheels over the parquet files for a specific column
+    /// Min/Max pruning wheels for a specific column
     min_max_wheels: Arc<Mutex<HashMap<String, ReaderWheel<F64MinMaxAggregator>>>>,
     // TODO: add support for other aggregation wheels
+    sum_wheels: Arc<Mutex<HashMap<String, ReaderWheel<F64SumAggregator>>>>,
     // aggregation_wheels: Arc<Mutex<HashMap<Expr, ReaderWheel<?>>>>,
     /// Table provider which UWheelOptimizer builds indexes on top of
     inner_provider: Arc<dyn TableProvider>,
+    /// Default Wheel configuration that is used to build indexes
     haw_conf: HawConf,
 }
 
@@ -64,20 +72,28 @@ impl UWheelOptimizer {
         name: impl Into<String>,
         time_column: impl Into<String>,
         min_max_columns: Vec<String>,
+        sum_columns: Vec<String>,
         provider: Arc<dyn TableProvider>,
         haw_conf: HawConf,
     ) -> Result<Self> {
         let time_column = time_column.into();
 
         // Create an initial instance of the UWheelOptimizer
-        let (count, min_max_wheels) =
-            build(provider.clone(), &time_column, min_max_columns, &haw_conf).await?;
+        let (count, min_max_wheels, sum_wheels) = build(
+            provider.clone(),
+            &time_column,
+            min_max_columns,
+            sum_columns,
+            &haw_conf,
+        )
+        .await?;
 
         Ok(Self {
             name: name.into(),
             time_column,
             count,
             min_max_wheels: Arc::new(Mutex::new(min_max_wheels)),
+            sum_wheels: Arc::new(Mutex::new(sum_wheels)),
             inner_provider: provider,
             haw_conf,
         })
@@ -116,6 +132,103 @@ impl UWheelOptimizer {
 }
 
 impl UWheelOptimizer {
+    /// This function takes a logical plan and checks whether it can be optimized using ``uwheel``
+    ///
+    /// If the plan can be optimized, it returns an optimized execution plan. Otherwise, it returns `None`.
+    pub fn try_optimize(&self, plan: &LogicalPlan) -> Option<Arc<dyn ExecutionPlan>> {
+        match plan {
+            LogicalPlan::Aggregate(agg) => self.handle_aggregate(agg),
+            LogicalPlan::Filter(filter) => self.handle_filter(filter, plan),
+            _ => None,
+        }
+    }
+
+    fn handle_aggregate(&self, agg: &Aggregate) -> Option<Arc<dyn ExecutionPlan>> {
+        if let LogicalPlan::Projection(projection) = agg.input.as_ref() {
+            if let LogicalPlan::Filter(filter) = projection.input.as_ref() {
+                // SELECT AGG FROM X WHERE TIME >= X AND TIME <= Y
+
+                // Check no GROUP BY and only one aggregation (for now)
+                if agg.group_expr.is_empty() && agg.aggr_expr.len() == 1 {
+                    let agg_expr = agg.aggr_expr.first().unwrap();
+                    match agg_expr {
+                        // COUNT(*)
+                        Expr::Alias(alias) if alias.name == COUNT_STAR_ALIAS => {
+                            let range = extract_wheel_range(&filter.predicate, &self.time_column)?;
+                            return Some(self.count_exec(range));
+                        }
+                        // SUM(col)
+                        Expr::AggregateFunction(agg)
+                            if agg.args.len() == 1
+                                && matches!(
+                                    agg.func_def,
+                                    AggregateFunctionDefinition::BuiltIn(AggregateFunction::Sum)
+                                ) =>
+                        {
+                            if let Expr::Column(col) = &agg.args[0] {
+                                let wheel = self.sum_wheels.lock().unwrap().get(&col.name)?.clone();
+                                let range =
+                                    extract_wheel_range(&filter.predicate, &self.time_column)?;
+                                let table_ref = if let Some(table_ref) = col.relation.as_ref() {
+                                    table_ref.to_quoted_string()
+                                } else {
+                                    "".to_string()
+                                };
+                                let name = format!("SUM({}.{})", table_ref, col.name);
+                                return Some(self.sum_exec(wheel, name, range));
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn handle_filter(&self, filter: &Filter, plan: &LogicalPlan) -> Option<Arc<dyn ExecutionPlan>> {
+        // Check COUNT wheel whether a range has any entries at
+        if let Some(range) = extract_wheel_range(&filter.predicate, &self.time_column) {
+            // query the wheel and if count == 0 then return empty execution.
+            let count = self.count(range).unwrap_or(0);
+            if count == 0 {
+                let schema = Arc::new(plan.schema().clone().as_arrow().clone());
+                Some(Arc::new(EmptyExec::new(schema)))
+            } else {
+                None
+            }
+        } else if let Some(UWheelExpr::MinMaxFilter(min_max)) =
+            extract_uwheel_expr(&filter.predicate, &self.time_column)
+        {
+            self.maybe_min_max_filter(min_max, plan)
+        } else {
+            None
+        }
+    }
+    fn maybe_min_max_filter(
+        &self,
+        min_max: MinMaxFilter,
+        plan: &LogicalPlan,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        // First check whether there is a matching min max wheel
+        let wheel = self.min_max_wheel(min_max.predicate.name.as_ref())?;
+
+        // Cast the literal scalar value to f64
+        let Ok(cast_scalar) = min_max.predicate.scalar.cast_to(&DataType::Float64) else {
+            return None;
+        };
+
+        // extract the f64 value from the scalar
+        let ScalarValue::Float64(Some(value)) = cast_scalar else {
+            return None;
+        };
+        // query the MinMax state from our wheel
+        let min_max_agg = wheel.combine_range_and_lower(min_max.range)?;
+
+        maybe_min_max_exec(value, &min_max.predicate.op, min_max_agg, plan)
+    }
+
+    // helper fn to return a UWheelCount Execution plan
     fn count_exec(&self, range: WheelRange) -> Arc<dyn ExecutionPlan> {
         let name = COUNT_STAR_ALIAS.to_string();
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -125,55 +238,40 @@ impl UWheelOptimizer {
         )]));
         Arc::new(UWheelCountExec::new(self.count.clone(), schema, range))
     }
-    /// This function takes a logical plan and checks whether it can be optimized using ``uwheel``
-    pub fn try_optimize(&self, plan: &LogicalPlan) -> Option<Arc<dyn ExecutionPlan>> {
-        match plan {
-            LogicalPlan::Aggregate(agg) => {
-                if let LogicalPlan::Projection(projection) = agg.input.as_ref() {
-                    if let LogicalPlan::Filter(filter) = projection.input.as_ref() {
-                        // SELECT AGG FROM X WHERE TIME >= X AND TIME <= Y
 
-                        // Check no GROUP BY and only one aggregation (for now)
-                        if agg.group_expr.is_empty() && agg.aggr_expr.len() == 1 {
-                            let agg_expr = agg.aggr_expr.first().unwrap();
-                            match agg_expr {
-                                // COUNT(*)
-                                Expr::Alias(alias) if alias.name == COUNT_STAR_ALIAS => {
-                                    // Extract Wheel Range for temporal filter
-                                    if let Some((Some(start), Some(end))) =
-                                        extract_wheel_range(&filter.predicate, &self.time_column)
-                                    {
-                                        // TODO: check if the range is queryable otherwise return None
-                                        let range =
-                                            WheelRange::new_unchecked(start as u64, end as u64);
-                                        return Some(self.count_exec(range));
-                                    }
-                                }
-                                // SUM(col)
-                                Expr::AggregateFunction(agg)
-                                    if agg.args.len() == 1
-                                        && matches!(
-                                            agg.func_def,
-                                            AggregateFunctionDefinition::BuiltIn(
-                                                AggregateFunction::Sum
-                                            )
-                                        ) =>
-                                {
-                                    if let Expr::Column(col) = &agg.args[0] {
-                                        dbg!(col);
-                                        // TODO: Check whether name and relation fit any wheel
-                                    }
-                                }
-                                _ => (),
-                            }
-                        }
-                    }
-                }
+    // helper fn to return a UWheelSum Execution plan
+    fn sum_exec(
+        &self,
+        wheel: ReaderWheel<F64SumAggregator>,
+        name: String,
+        range: WheelRange,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name.clone(),
+            DataType::Float64,
+            true,
+        )]));
+        Arc::new(UWheelSumExec::new(wheel, schema, range))
+    }
+}
 
-                None
-            }
-            _ => None,
-        }
+// helper function to check whether we can return an empty execution plan based on min/max pruning
+fn maybe_min_max_exec(
+    value: f64,
+    op: &Operator,
+    min_max_agg: MinMaxState<f64>,
+    plan: &LogicalPlan,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    if op == &Operator::Gt && min_max_agg.max_value() < value
+        || op == &Operator::GtEq && min_max_agg.max_value() <= value
+        || op == &Operator::Lt && min_max_agg.min_value() > value
+        || op == &Operator::LtEq && min_max_agg.min_value() >= value
+    {
+        Some(Arc::new(EmptyExec::new(Arc::new(
+            plan.schema().clone().as_arrow().clone(),
+        ))))
+    } else {
+        None
     }
 }
 
@@ -186,7 +284,7 @@ impl QueryPlanner for UWheelOptimizer {
         state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // If the optimization fails, use the default physical planner
-        match self.try_optimize(&logical_plan) {
+        match self.try_optimize(logical_plan) {
             Some(exec) => Ok(exec),
             None => {
                 DefaultPhysicalPlanner::default()
@@ -204,10 +302,12 @@ async fn build(
     provider: Arc<dyn TableProvider>,
     time_column: &str,
     min_max_columns: Vec<String>,
+    sum_columns: Vec<String>,
     haw_conf: &HawConf,
 ) -> Result<(
     ReaderWheel<U32SumAggregator>,
     HashMap<String, ReaderWheel<F64MinMaxAggregator>>,
+    HashMap<String, ReaderWheel<F64SumAggregator>>,
 )> {
     let ctx = SessionContext::new();
     let scan = provider.scan(&ctx.state(), None, &[], None).await?;
@@ -239,7 +339,7 @@ async fn build(
     let (count_wheel, min_timestamp_ms, max_timestamp_ms) = build_count_wheel(timestamps, haw_conf);
 
     // Build MinMax wheels for specified columns
-    let mut map = HashMap::new();
+    let mut min_max_map = HashMap::new();
     for column in min_max_columns.iter() {
         let min_max_wheel = build_min_max_wheel(
             provider.schema(),
@@ -248,13 +348,29 @@ async fn build(
             max_timestamp_ms,
             time_column,
             column,
-            &haw_conf,
+            haw_conf,
         )
         .await?;
-        map.insert(column.to_string(), min_max_wheel);
+        min_max_map.insert(column.to_string(), min_max_wheel);
     }
 
-    Ok((count_wheel.read().clone(), map))
+    // Build Sum wheels for specified columns
+    let mut sum_map = HashMap::new();
+    for column in sum_columns.iter() {
+        let sum_wheel = build_sum_wheel(
+            provider.schema(),
+            &batches,
+            min_timestamp_ms,
+            max_timestamp_ms,
+            time_column,
+            column,
+            haw_conf,
+        )
+        .await?;
+        sum_map.insert(column.to_string(), sum_wheel);
+    }
+
+    Ok((count_wheel.read().clone(), min_max_map, sum_map))
 }
 
 async fn build_min_max_wheel(
@@ -271,7 +387,7 @@ async fn build_min_max_wheel(
     let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
     let start_ms = date.timestamp_millis() as u64;
 
-    let conf = haw_conf.clone().with_watermark(start_ms);
+    let conf = haw_conf.with_watermark(start_ms);
 
     let mut wheel: RwWheel<F64MinMaxAggregator> = RwWheel::with_conf(
         Conf::default()
@@ -304,7 +420,71 @@ async fn build_min_max_wheel(
                 .copied()
                 .zip(min_max_column_array.values().iter().copied())
             {
-                let timestamp_ms = DateTime::from_timestamp_micros(timestamp as i64)
+                let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
+                    .unwrap()
+                    .timestamp_millis() as u64;
+                let entry = Entry::new(value, timestamp_ms);
+                wheel.insert(entry);
+            }
+        }
+        // Once all data is inserted, advance the wheel to the max timestamp
+        wheel.advance_to(max_timestamp_ms);
+    } else {
+        // TODO: return Datafusion Error?
+        panic!("Min/Max column must be a numeric type");
+    }
+
+    Ok(wheel.read().clone())
+}
+
+async fn build_sum_wheel(
+    schema: SchemaRef,
+    batches: &[RecordBatch],
+    _min_timestamp_ms: u64,
+    max_timestamp_ms: u64,
+    time_col: &str,
+    min_max_col: &str,
+    haw_conf: &HawConf,
+) -> Result<ReaderWheel<F64SumAggregator>> {
+    // TODO: remove hardcoded time
+    let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
+    let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
+    let start_ms = date.timestamp_millis() as u64;
+
+    let conf = haw_conf.with_watermark(start_ms);
+
+    let mut wheel: RwWheel<F64SumAggregator> = RwWheel::with_conf(
+        Conf::default()
+            .with_haw_conf(conf)
+            .with_write_ahead(64000usize.next_power_of_two()),
+    );
+
+    let column_index = schema.index_of(min_max_col)?;
+    let column_field = schema.field(column_index);
+
+    if is_numeric_type(column_field.data_type()) {
+        for batch in batches {
+            let time_array = batch
+                .column_by_name(time_col)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+
+            let min_max_column_array = batch
+                .column_by_name(min_max_col)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+
+            for (timestamp, value) in time_array
+                .values()
+                .iter()
+                .copied()
+                .zip(min_max_column_array.values().iter().copied())
+            {
+                let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
                     .unwrap()
                     .timestamp_millis() as u64;
                 let entry = Entry::new(value, timestamp_ms);
@@ -343,7 +523,7 @@ fn build_count_wheel(
     let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
     let start_ms = date.timestamp_millis() as u64;
 
-    let conf = haw_conf.clone().with_watermark(start_ms);
+    let conf = haw_conf.with_watermark(start_ms);
 
     let mut count_wheel: RwWheel<U32SumAggregator> = RwWheel::with_conf(
         Conf::default()
@@ -352,7 +532,7 @@ fn build_count_wheel(
     );
 
     for timestamp in timestamps {
-        let timestamp_ms = DateTime::from_timestamp_micros(timestamp as i64)
+        let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
             .unwrap()
             .timestamp_millis() as u64;
         // Record a count
@@ -386,251 +566,4 @@ fn is_numeric_type(data_type: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
     )
-}
-
-// UWheelOptimizer helper methods
-
-fn extract_wheel_range(predicate: &Expr, time_column: &str) -> Option<(Option<i64>, Option<i64>)> {
-    match predicate {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            //dbg!(left, op, right);
-            if let Operator::And = op {
-                let left = extract_wheel_range(left, time_column);
-                let right = extract_wheel_range(right, time_column);
-                //dbg!(left, right);
-
-                if let Some((start, _)) = left {
-                    if let Some((_, end)) = right {
-                        return Some((start, end));
-                    }
-                }
-            } else {
-                if let Expr::Column(col) = left.as_ref() {
-                    if col.name == time_column {
-                        match op {
-                            Operator::GtEq | Operator::Gt => {
-                                return extract_timestamp(right).map(|ts| (Some(ts), None::<i64>));
-                            }
-                            Operator::Lt | Operator::LtEq => {
-                                return extract_timestamp(right).map(|ts| (None::<i64>, Some(ts)));
-                            }
-
-                            _ => return None,
-                        };
-                    }
-                }
-            }
-        }
-        Expr::Between(Between {
-            expr,
-            negated,
-            low,
-            high,
-        }) => {
-            if let Expr::Column(col) = expr.as_ref() {
-                if col.name == time_column && !negated {
-                    if let Some(start) = extract_timestamp(low) {
-                        if let Some(end) = extract_timestamp(high) {
-                            return Some((Some(start), Some(end)));
-                        }
-                    }
-                }
-            }
-        }
-        _ => (),
-    }
-    None
-}
-
-fn extract_timestamp(expr: &Expr) -> Option<i64> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(date_str))) => DateTime::parse_from_rfc3339(date_str)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc).timestamp_millis()),
-        Expr::Literal(ScalarValue::TimestampMillisecond(Some(ms), _)) => Some(*ms as i64),
-        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(*us / 1000 as i64),
-        Expr::Literal(ScalarValue::TimestampNanosecond(Some(ns), _)) => {
-            Some(ns / 1_000_000) // Convert nanoseconds to milliseconds
-        }
-        // Add other cases as needed, e.g., for different date/time formats
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_timestamp_test() {
-        let expr = Expr::Literal(ScalarValue::Utf8(Some("2023-01-01T00:00:00Z".to_string())));
-        assert_eq!(extract_timestamp(&expr), Some(1672531200000));
-    }
-
-    fn create_timestamp(date_string: &str) -> i64 {
-        DateTime::parse_from_rfc3339(date_string)
-            .unwrap()
-            .with_timezone(&Utc)
-            .timestamp_millis()
-    }
-
-    #[test]
-    fn test_single_greater_than_or_equal() {
-        let expr = col("timestamp").gt_eq(lit("2023-01-01T00:00:00Z"));
-        let result = extract_wheel_range(&expr, "timestamp");
-        assert_eq!(
-            result,
-            Some((Some(create_timestamp("2023-01-01T00:00:00Z")), None))
-        );
-    }
-
-    #[test]
-    fn test_range_with_and() {
-        let expr = col("timestamp")
-            .gt_eq(lit("2023-01-01T00:00:00Z"))
-            .and(col("timestamp").lt(lit("2023-12-31T23:59:59Z")));
-        let result = extract_wheel_range(&expr, "timestamp");
-        assert_eq!(
-            result,
-            Some((
-                Some(create_timestamp("2023-01-01T00:00:00Z")),
-                Some(create_timestamp("2023-12-31T23:59:59Z"))
-            ))
-        );
-    }
-    #[test]
-    fn test_with_non_matching_column() {
-        let expr = col("other_column").gt_eq(lit("2023-01-01T00:00:00Z"));
-        let result = extract_wheel_range(&expr, "timestamp");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_with_non_temporal_expression() {
-        let expr = col("timestamp").eq(lit(42));
-        let result = extract_wheel_range(&expr, "timestamp");
-        assert_eq!(result, None);
-    }
-
-    /*
-     #[test]
-     fn test_range_with_less_than_or_equal() {
-         let expr = col("timestamp")
-             .gt_eq(lit("2023-01-01T00:00:00Z"))
-             .and(col("timestamp").lt_eq(lit("2023-12-31T23:59:59Z")));
-         let result = extract_datetime_range(&expr, "timestamp");
-         assert_eq!(
-             result,
-             Some((
-                 create_timestamp("2023-01-01T00:00:00Z"),
-                 Some(create_timestamp("2023-12-31T23:59:59Z"))
-             ))
-         );
-     }
-
-
-
-    */
-
-    /*
-    use datafusion::arrow::datatypes::{Schema, TimeUnit};
-    use datafusion::datasource::TableType;
-    use datafusion::execution::runtime_env::RuntimeEnv;
-    use datafusion::logical_expr::{LogicalPlanBuilder, TableSource};
-    use datafusion::prelude::{col, lit, Expr};
-    use std::any::Any;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_uwheel_planner() -> Result<()> {
-        // Create a mock schema
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "tpep_dropoff_datetime",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
-            Field::new("fare_amount", DataType::Float64, false),
-        ]));
-
-        let provider = Arc::new(MockTableProvider::new(schema));
-        // Create a mock logical plan
-        let logical_plan = LogicalPlanBuilder::scan("yellow_tripdata", provider.clone(), None)?
-            .filter(col("tpep_dropoff_datetime").gt_eq(lit("2023-01-01T00:00:00Z")))?
-            .filter(col("tpep_dropoff_datetime").lt(lit("2023-01-02T00:00:00Z")))?
-            .build()?;
-
-        // Create a mock session state
-        let session_state =
-            SessionState::new_with_config_rt(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
-
-        let optimizer = Arc::new(
-            crate::builder::Builder::new("tpep_dropoff_datetime")
-                .with_name("yellow_tripdata")
-                .build_with_provider(provider)
-                .await?,
-        );
-
-        Ok(())
-    }
-
-    // Mock TableProvider for testing
-    struct MockTableProvider {
-        schema: Arc<Schema>,
-    }
-
-    impl MockTableProvider {
-        fn new(schema: Arc<Schema>) -> Self {
-            Self { schema }
-        }
-    }
-
-    impl TableSource for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn schema(&self) -> Arc<Schema> {
-            self.schema.clone()
-        }
-
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl TableProvider for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-        fn schema(&self) -> Arc<Schema> {
-            self.schema.clone()
-        }
-        async fn scan(
-            &self,
-            _state: &SessionState,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            unimplemented!();
-            /*
-            Ok(Arc::new(MemoryExec::try_new(&vec![RecordBatch::try_new(
-                self.schema.clone(),
-                vec![
-                    Arc::new(TimestampArray::from_vec(
-                        vec![Some(1672531200000), Some(1672617600000)],
-                        None,
-                    )),
-                    Arc::new(Float64Array::from_vec(vec![42.0, 43.0])),
-                ],
-            )?])?))
-            */
-        }
-    }
-    */
 }

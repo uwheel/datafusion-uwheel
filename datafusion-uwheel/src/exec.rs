@@ -3,7 +3,7 @@ use std::{fmt::Formatter, sync::Arc};
 
 use datafusion::{
     arrow::{
-        array::{ArrayRef, Int64Array, RecordBatch},
+        array::{ArrayRef, Float64Array, Int64Array, RecordBatch},
         datatypes::SchemaRef,
     },
     physical_expr::EquivalenceProperties,
@@ -12,7 +12,11 @@ use datafusion::{
         ExecutionPlan, Partitioning, PlanProperties,
     },
 };
-use uwheel::{aggregator::sum::U32SumAggregator, wheels::read::ReaderWheel, WheelRange};
+use uwheel::{
+    aggregator::sum::{F64SumAggregator, U32SumAggregator},
+    wheels::read::ReaderWheel,
+    WheelRange,
+};
 
 use crate::COUNT_STAR_ALIAS;
 
@@ -101,6 +105,106 @@ impl ExecutionPlan for UWheelCountExec {
         _children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
         unimplemented!("UWheelCountExec::with_new_children");
+    }
+
+    fn children(&self) -> Vec<std::sync::Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+    fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
+        None
+    }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+/// An ExecutionPlan for SUM Aggregations on top of a UWheel
+pub struct UWheelSumExec {
+    wheel: ReaderWheel<F64SumAggregator>,
+    schema: SchemaRef,
+    range: WheelRange,
+    properties: PlanProperties,
+}
+
+impl UWheelSumExec {
+    pub fn new(wheel: ReaderWheel<F64SumAggregator>, schema: SchemaRef, range: WheelRange) -> Self {
+        Self {
+            wheel,
+            schema: schema.clone(),
+            range,
+            properties: Self::compute_properties(schema),
+        }
+    }
+    // taken from Datafusion repo
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+        PlanProperties::new(
+            eq_properties,
+            // Output Partitioning
+            Partitioning::UnknownPartitioning(1),
+            // Execution Mode
+            ExecutionMode::Bounded,
+        )
+    }
+}
+
+impl fmt::Debug for UWheelSumExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let wheel_exec_plan = self
+            .wheel
+            .as_ref()
+            .explain_combine_range(self.range)
+            .unwrap();
+        write!(f, "UWheelSumExec {:#?}", wheel_exec_plan)
+    }
+}
+impl DisplayAs for UWheelSumExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> Result<(), core::fmt::Error> {
+        write!(f, "UWheelCountExec")
+    }
+}
+
+impl ExecutionPlan for UWheelSumExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &'static str
+    where
+        Self: Sized,
+    {
+        "uwheel_sum_exec"
+    }
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: std::sync::Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+        let count = self
+            .wheel
+            .combine_range_and_lower(self.range)
+            .unwrap_or(0.0);
+        let name = "SUM(fare_amount)".to_string();
+        let data = Float64Array::from(vec![count]);
+        let record_batch = RecordBatch::try_from_iter(vec![(&name, Arc::new(data) as ArrayRef)])?;
+
+        let fut = futures::future::ready(Ok(record_batch.clone()));
+        let stream = futures::stream::once(fut);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn statistics(&self) -> datafusion::error::Result<datafusion::common::Statistics> {
+        unimplemented!("UWheelSumExec::statistics");
+    }
+    fn with_new_children(
+        self: std::sync::Arc<Self>,
+        _children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
+        unimplemented!("UWheelSumExec::with_new_children");
     }
 
     fn children(&self) -> Vec<std::sync::Arc<dyn ExecutionPlan>> {

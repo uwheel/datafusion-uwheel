@@ -8,10 +8,14 @@ use datafusion::{
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
     error::Result,
-    physical_plan::{aggregates::AggregateExec, collect},
+    physical_plan::{coalesce_batches::CoalesceBatchesExec, collect, empty::EmptyExec},
     prelude::SessionContext,
 };
-use datafusion_uwheel::{builder::Builder, exec::UWheelCountExec, UWheelOptimizer};
+use datafusion_uwheel::{
+    builder::Builder,
+    exec::{UWheelCountExec, UWheelSumExec},
+    UWheelOptimizer,
+};
 use uwheel::{
     aggregator::min_max::{F64MinMaxAggregator, MinMaxState},
     wheels::read::ReaderWheel,
@@ -48,6 +52,7 @@ async fn main() -> Result<()> {
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
             .with_min_max_wheels(vec!["fare_amount", "trip_distance"]) // Create Min/Max wheels for the columns "fare_amount" and "trip_distance"
+            .with_sum_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
             .await
             .unwrap(),
@@ -90,8 +95,51 @@ async fn main() -> Result<()> {
         .create_physical_plan()
         .await?;
 
-    // This plan is currently an AggregateExec but should be optimized!
-    assert!(sum_plan.as_any().downcast_ref::<AggregateExec>().is_some());
+    assert!(sum_plan.as_any().downcast_ref::<UWheelSumExec>().is_some());
+    dbg!(&sum_plan);
+
+    let results: Vec<RecordBatch> = collect(sum_plan, ctx.task_ctx()).await?;
+    arrow::util::pretty::print_batches(&results).unwrap();
+
+    let physical_plan = ctx
+        .sql(
+            "SELECT * FROM yellow_tripdata
+                     WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
+                     AND tpep_dropoff_datetime < '2022-01-01T00:00:02Z'",
+        )
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    // Verify that the plan is optimized to EmptyExec
+    assert!(physical_plan.as_any().downcast_ref::<EmptyExec>().is_some());
+
+    let physical_plan = ctx
+        .sql(
+            "SELECT * FROM yellow_tripdata
+                         WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
+                         AND tpep_dropoff_datetime < '2022-01-02T00:00:00Z'",
+        )
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    assert!(physical_plan
+        .as_any()
+        .downcast_ref::<CoalesceBatchesExec>()
+        .is_some());
+
+    let min_max = ctx
+        .sql(
+            "SELECT * FROM yellow_tripdata
+             WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
+             AND tpep_dropoff_datetime < '2022-01-02T00:00:00Z'
+             AND fare_amount > 1000",
+        )
+        .await?
+        .create_physical_plan()
+        .await?;
+    dbg!(min_max);
 
     // The following wheel can be used to quickly filter queries such as:
     // SELECT * FROM yellow_tripdata
