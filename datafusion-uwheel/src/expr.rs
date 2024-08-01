@@ -48,7 +48,7 @@ pub fn extract_wheel_range(predicate: &Expr, time_column: &str) -> Option<WheelR
             if start > end {
                 None
             } else {
-                Some(WheelRange::new(start as u64, end as u64).unwrap())
+                WheelRange::new(start as u64, end as u64).ok()
             }
         } else {
             None
@@ -94,6 +94,29 @@ fn handle_binary_expr(binary_expr: &BinaryExpr, time_column: &str) -> Option<UWh
     match op {
         Operator::And => handle_and_operator(left, right, time_column),
         _ => handle_comparison_operator(left, op, right, time_column),
+    }
+}
+
+pub fn extract_filter_expr(
+    predicate: &Expr,
+    time_column: &str,
+) -> Option<(WheelRange, Option<Expr>)> {
+    match predicate {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            if op == &Operator::And {
+                // TODO: refactor
+                if let Some(range) = extract_wheel_range(left, time_column) {
+                    return Some((range, Some(*right.clone())));
+                }
+                if let Some(range) = extract_wheel_range(right, time_column) {
+                    return Some((range, Some(*left.clone())));
+                }
+                // try to extract only a temporal WheelRange filter
+                return extract_wheel_range(predicate, time_column).map(|range| (range, None));
+            }
+            None
+        }
+        _ => None,
     }
 }
 

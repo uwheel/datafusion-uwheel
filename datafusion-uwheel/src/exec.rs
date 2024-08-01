@@ -123,15 +123,22 @@ pub struct UWheelSumExec {
     wheel: ReaderWheel<F64SumAggregator>,
     schema: SchemaRef,
     range: WheelRange,
+    name: String,
     properties: PlanProperties,
 }
 
 impl UWheelSumExec {
-    pub fn new(wheel: ReaderWheel<F64SumAggregator>, schema: SchemaRef, range: WheelRange) -> Self {
+    pub fn new(
+        wheel: ReaderWheel<F64SumAggregator>,
+        schema: SchemaRef,
+        name: String,
+        range: WheelRange,
+    ) -> Self {
         Self {
             wheel,
             schema: schema.clone(),
             range,
+            name,
             properties: Self::compute_properties(schema),
         }
     }
@@ -160,7 +167,7 @@ impl fmt::Debug for UWheelSumExec {
 }
 impl DisplayAs for UWheelSumExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> Result<(), core::fmt::Error> {
-        write!(f, "UWheelCountExec")
+        write!(f, "UWheelSumExec")
     }
 }
 
@@ -183,7 +190,7 @@ impl ExecutionPlan for UWheelSumExec {
             .wheel
             .combine_range_and_lower(self.range)
             .unwrap_or(0.0);
-        let name = "SUM(fare_amount)".to_string();
+        let name = self.name.clone();
         let data = Float64Array::from(vec![count]);
         let record_batch = RecordBatch::try_from_iter(vec![(&name, Arc::new(data) as ArrayRef)])?;
 

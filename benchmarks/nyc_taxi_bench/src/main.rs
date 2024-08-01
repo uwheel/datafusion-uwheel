@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
         .and_utc();
 
     let random_fare_amounts: Vec<f64> = (0..args.queries)
-        .map(|_| fastrand::u64(1..10000) as f64)
+        .map(|_| fastrand::u64(500..1000) as f64)
         .collect();
 
     println!("===== SECOND RANGES =====");
@@ -150,6 +150,14 @@ pub async fn bench(
         &uwheel_ctx,
         &ranges,
         &fares,
+    )
+    .await;
+
+    bench_datafusion_temporal_projection("datafusion-select(*)-count-filter", &ctx, &ranges).await;
+    bench_datafusion_temporal_projection(
+        "datafusion-uwheel-select(*)-count-filter",
+        &uwheel_ctx,
+        &ranges,
     )
     .await;
 }

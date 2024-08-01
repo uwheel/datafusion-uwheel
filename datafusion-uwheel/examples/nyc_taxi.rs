@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use datafusion::{
     arrow::{self, array::RecordBatch},
     datasource::{
@@ -9,17 +8,13 @@ use datafusion::{
     },
     error::Result,
     physical_plan::{coalesce_batches::CoalesceBatchesExec, collect, empty::EmptyExec},
-    prelude::SessionContext,
+    prelude::{col, count, lit, SessionContext},
+    scalar::ScalarValue,
 };
 use datafusion_uwheel::{
     builder::Builder,
     exec::{UWheelCountExec, UWheelSumExec},
-    UWheelOptimizer,
-};
-use uwheel::{
-    aggregator::min_max::{F64MinMaxAggregator, MinMaxState},
-    wheels::read::ReaderWheel,
-    WheelRange,
+    AggregateType, IndexBuilder, UWheelOptimizer,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -51,12 +46,18 @@ async fn main() -> Result<()> {
     let optimizer: Arc<UWheelOptimizer> = Arc::new(
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
-            .with_min_max_wheels(vec!["fare_amount", "trip_distance"]) // Create Min/Max wheels for the columns "fare_amount" and "trip_distance"
+            .with_min_max_wheels(vec!["fare_amount", "trip_distance"])
             .with_sum_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
             .await
             .unwrap(),
     );
+
+    // Build a wheel for a custom expression
+    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
+        .with_filter(col("passenger_count").eq(lit(ScalarValue::Float64(Some(4.0)))));
+
+    optimizer.build_index(builder).await?;
 
     // Set UWheelOptimizer as the query planner
     let session_state = ctx.state().with_query_planner(optimizer.clone());
@@ -88,15 +89,12 @@ async fn main() -> Result<()> {
     let sum_plan = ctx
         .sql(
             "SELECT SUM(fare_amount) FROM yellow_tripdata
-                 WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
-                 AND tpep_dropoff_datetime < '2022-02-01T00:00:00Z'",
+             WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
+             AND tpep_dropoff_datetime < '2022-02-01T00:00:00Z'",
         )
         .await?
         .create_physical_plan()
         .await?;
-
-    assert!(sum_plan.as_any().downcast_ref::<UWheelSumExec>().is_some());
-    dbg!(&sum_plan);
 
     let results: Vec<RecordBatch> = collect(sum_plan, ctx.task_ctx()).await?;
     arrow::util::pretty::print_batches(&results).unwrap();
@@ -104,8 +102,8 @@ async fn main() -> Result<()> {
     let physical_plan = ctx
         .sql(
             "SELECT * FROM yellow_tripdata
-                     WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
-                     AND tpep_dropoff_datetime < '2022-01-01T00:00:02Z'",
+             WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
+             AND tpep_dropoff_datetime < '2022-01-01T00:00:02Z'",
         )
         .await?
         .create_physical_plan()
@@ -117,8 +115,8 @@ async fn main() -> Result<()> {
     let physical_plan = ctx
         .sql(
             "SELECT * FROM yellow_tripdata
-                         WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
-                         AND tpep_dropoff_datetime < '2022-01-02T00:00:00Z'",
+             WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
+             AND tpep_dropoff_datetime < '2022-01-02T00:00:00Z'",
         )
         .await?
         .create_physical_plan()
@@ -139,72 +137,45 @@ async fn main() -> Result<()> {
         .await?
         .create_physical_plan()
         .await?;
-    dbg!(min_max);
+    // verify that it returned an EmptyExec
+    assert!(min_max.as_any().downcast_ref::<EmptyExec>().is_some());
 
-    // The following wheel can be used to quickly filter queries such as:
-    // SELECT * FROM yellow_tripdata
-    // WHERE tpep_dropoff_datetime >= '?' and < '?'
-    //
-    // Or can be used to quickly count the number of records between two dates
-    // SELECT COUNT(*) FROM yellow_tripdata
-    // WHERE tpep_dropoff_datetime >= '?' and < '?'
-    let count_wheel = optimizer.count_wheel();
+    let between_plan = ctx
+        .sql(
+            "SELECT COUNT(*) FROM yellow_tripdata
+             WHERE tpep_dropoff_datetime BETWEEN '2022-01-01T00:00:00Z'
+             AND '2022-02-01T00:00:00Z'",
+        )
+        .await?
+        .create_physical_plan()
+        .await?;
 
-    println!("Landmark COUNT(*) {:?}", count_wheel.landmark());
-
-    // The following wheel can be used to quickly filter queries such as:
-    // SELECT * FROM yellow_tripdata
-    // WHERE tpep_dropoff_datetime >= '?' and < '?'
-    // AND fare_amount > 1000
-    let fare_wheel = optimizer.min_max_wheel("fare_amount").unwrap();
-
-    // let's use the dates 2022-01-01 and 2022-01-10 to illustrate
-    let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
-    let start_date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
-
-    let end = NaiveDate::from_ymd_opt(2022, 1, 10).unwrap();
-    let end_date = Utc.from_utc_datetime(&end.and_hms_opt(0, 0, 0).unwrap());
-
-    // Whether there are fare amounts above 1000.0
-    // DataFusion Expr: let expr = col("fare_amount").gt(lit(1000.0));
-    let fare_pred = |min_max_state: MinMaxState<f64>| min_max_state.max_value() > 1000.0;
-
-    // Check whether the filter between 2022-01-01  and 2022-01-10 can be skipped
-    if temporal_filter(&fare_wheel, start_date, end_date, fare_pred) {
-        println!("Cannot skip execution since there are rides with fare_amount > 1000.0 between {:?} and {:?}", start_date, end_date);
-    } else {
-        println!("Skipping execution since there no rides with fare_amount > 1000.0 between {:?} and {:?}", start_date, end_date);
-    }
-
-    // Check whether the filter between 2022-01-01 12:30 and 12:50 can be skipped
-    let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
-    let start_date = Utc.from_utc_datetime(&start.and_hms_opt(12, 30, 0).unwrap());
-
-    let end = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
-    let end_date = Utc.from_utc_datetime(&end.and_hms_opt(12, 50, 0).unwrap());
-
-    if temporal_filter(&fare_wheel, start_date, end_date, fare_pred) {
-        println!("Cannot skip execution since there are rides with fare_amount > 1000.0 between {:?} and {:?}", start_date, end_date);
-    } else {
-        println!("Skipping execution since there no rides with fare_amount > 1000.0 between {:?} and {:?}", start_date, end_date);
-    }
-    Ok(())
-}
-
-// Executes a temporal wheel filter to determine whether a query can be skipped
-fn temporal_filter(
-    wheel: &ReaderWheel<F64MinMaxAggregator>,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    predicate: impl Fn(MinMaxState<f64>) -> bool,
-) -> bool {
-    let start_ms = start.timestamp_millis() as u64;
-    let end_ms = end.timestamp_millis() as u64;
-
-    // Get the Min/Max state between the start and end date
-    let min_max_state = wheel
-        .combine_range_and_lower(WheelRange::new_unchecked(start_ms, end_ms))
+    // The plan should be a UWheelCountExec
+    let uwheel_exec = between_plan
+        .as_any()
+        .downcast_ref::<UWheelCountExec>()
         .unwrap();
+    dbg!(uwheel_exec);
 
-    predicate(min_max_state)
+    // We created an index for this SQL query earlier so it execute as a UWheelSumExec
+    let sum_keyed_plan = ctx
+        .sql(
+            "SELECT SUM(fare_amount) FROM yellow_tripdata
+                 WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
+                 AND tpep_dropoff_datetime < '2022-02-01T00:00:00Z'
+                 AND passenger_count = 4.0",
+        )
+        .await?
+        .create_physical_plan()
+        .await?;
+
+    assert!(sum_keyed_plan
+        .as_any()
+        .downcast_ref::<UWheelSumExec>()
+        .is_some());
+
+    let results: Vec<RecordBatch> = collect(sum_keyed_plan, ctx.task_ctx()).await?;
+    arrow::util::pretty::print_batches(&results).unwrap();
+
+    Ok(())
 }

@@ -14,6 +14,10 @@ uwheel = { version = "0.2.0", default-features = false, features = [
     "sync",
     "min_max",
     "sum",
+    "avg",
+    "min",
+    "max",
+    "all",
 ] }
 datafusion = "38.0.0"
 async-trait = "0.1.81"

@@ -25,14 +25,20 @@ use datafusion::{
 };
 use datafusion::{error::Result, logical_expr::Aggregate};
 use exec::{UWheelCountExec, UWheelSumExec};
-use expr::{extract_uwheel_expr, extract_wheel_range, MinMaxFilter, UWheelExpr};
+use expr::{
+    extract_filter_expr, extract_uwheel_expr, extract_wheel_range, MinMaxFilter, UWheelExpr,
+};
 use uwheel::{
     aggregator::{
+        all::AllAggregator,
+        avg::F64AvgAggregator,
+        max::F64MaxAggregator,
+        min::F64MinAggregator,
         min_max::{F64MinMaxAggregator, MinMaxState},
         sum::{F64SumAggregator, U32SumAggregator},
     },
     wheels::read::ReaderWheel,
-    Conf, Entry, HawConf, RwWheel, WheelRange,
+    Aggregator, Conf, Entry, HawConf, RwWheel, WheelRange,
 };
 
 /// Custom aggregator implementations that are used by this crate.
@@ -44,7 +50,49 @@ pub mod exec;
 /// Various expressions that the optimizer supports
 mod expr;
 
+mod index;
+
+pub use index::{AggregateType, IndexBuilder};
+
 pub const COUNT_STAR_ALIAS: &str = "COUNT(*)";
+pub const STAR_AGGREGATION_ALIAS: &str = "*_AGG";
+
+pub type WheelMap<A> = Arc<Mutex<HashMap<String, ReaderWheel<A>>>>;
+
+#[derive(Clone)]
+pub struct BuiltInWheels {
+    /// A COUNT(*) wheel over the underlying table data and time column
+    pub count: ReaderWheel<U32SumAggregator>,
+    /// Min/Max pruning wheels for a specific column
+    pub min_max: WheelMap<F64MinMaxAggregator>,
+    /// SUM Aggregation Wheel Indices
+    pub sum: WheelMap<F64SumAggregator>,
+    /// AVG Aggregation Wheel Indices
+    pub avg: WheelMap<F64AvgAggregator>,
+    /// MAX Aggregation Wheel Indices
+    pub max: WheelMap<F64MaxAggregator>,
+    /// MIN Aggregation Wheel Indices
+    pub min: WheelMap<F64MinAggregator>,
+    /// ALL (SUM, AVG, MAX, MIN, COUNT) Aggregation Wheel Indices
+    pub all: WheelMap<AllAggregator>,
+}
+impl BuiltInWheels {
+    pub fn new(
+        count: ReaderWheel<U32SumAggregator>,
+        min_max_wheels: WheelMap<F64MinMaxAggregator>,
+        sum_wheels: WheelMap<F64SumAggregator>,
+    ) -> Self {
+        Self {
+            count,
+            min_max: min_max_wheels,
+            sum: sum_wheels,
+            avg: Default::default(),
+            min: Default::default(),
+            max: Default::default(),
+            all: Default::default(),
+        }
+    }
+}
 
 /// A µWheel optimizer for DataFusion that indexes wheels for time-based analytical queries.
 #[allow(dead_code)]
@@ -53,17 +101,16 @@ pub struct UWheelOptimizer {
     name: String,
     /// The column that contains the time
     time_column: String,
-    /// A COUNT(*) wheel over the underlying table data and time column
-    count: ReaderWheel<U32SumAggregator>,
-    /// Min/Max pruning wheels for a specific column
-    min_max_wheels: Arc<Mutex<HashMap<String, ReaderWheel<F64MinMaxAggregator>>>>,
-    // TODO: add support for other aggregation wheels
-    sum_wheels: Arc<Mutex<HashMap<String, ReaderWheel<F64SumAggregator>>>>,
-    // aggregation_wheels: Arc<Mutex<HashMap<Expr, ReaderWheel<?>>>>,
+    /// Set of built-in aggregation wheels
+    wheels: BuiltInWheels,
     /// Table provider which UWheelOptimizer builds indexes on top of
-    inner_provider: Arc<dyn TableProvider>,
+    provider: Arc<dyn TableProvider>,
     /// Default Wheel configuration that is used to build indexes
     haw_conf: HawConf,
+    /// The minimum timestamp in milliseconds for the underlying data using `time_column`
+    min_timestamp_ms: u64,
+    /// The maximum timestamp in milliseconds for the underlying data using `time_column`
+    max_timestamp_ms: u64,
 }
 
 impl UWheelOptimizer {
@@ -79,7 +126,7 @@ impl UWheelOptimizer {
         let time_column = time_column.into();
 
         // Create an initial instance of the UWheelOptimizer
-        let (count, min_max_wheels, sum_wheels) = build(
+        let (min_timestamp_ms, max_timestamp_ms, count, min_max_wheels, sum_wheels) = build(
             provider.clone(),
             &time_column,
             min_max_columns,
@@ -87,15 +134,18 @@ impl UWheelOptimizer {
             &haw_conf,
         )
         .await?;
+        let min_max_wheels = Arc::new(Mutex::new(min_max_wheels));
+        let sum_wheels = Arc::new(Mutex::new(sum_wheels));
+        let wheels = BuiltInWheels::new(count, min_max_wheels, sum_wheels);
 
         Ok(Self {
             name: name.into(),
             time_column,
-            count,
-            min_max_wheels: Arc::new(Mutex::new(min_max_wheels)),
-            sum_wheels: Arc::new(Mutex::new(sum_wheels)),
-            inner_provider: provider,
+            wheels,
+            provider,
             haw_conf,
+            min_timestamp_ms,
+            max_timestamp_ms,
         })
     }
 
@@ -104,37 +154,131 @@ impl UWheelOptimizer {
     /// Returns `None` if the count is not available
     #[inline]
     pub fn count(&self, range: WheelRange) -> Option<u32> {
-        self.count.combine_range_and_lower(range)
+        self.wheels.count.combine_range_and_lower(range)
     }
 
     /// Returns the inner TableProvider
     pub fn provider(&self) -> Arc<dyn TableProvider> {
-        self.inner_provider.clone()
+        self.provider.clone()
     }
 
     /// Returns a reference to the table's COUNT(*) wheel
     #[inline]
     pub fn count_wheel(&self) -> &ReaderWheel<U32SumAggregator> {
-        &self.count
+        &self.wheels.count
     }
 
     /// Returns a reference to a MIN/MAX wheel for a specified column
     pub fn min_max_wheel(&self, column: &str) -> Option<ReaderWheel<F64MinMaxAggregator>> {
-        self.min_max_wheels.lock().unwrap().get(column).cloned()
+        self.wheels.min_max.lock().unwrap().get(column).cloned()
     }
 
-    /// Builds a wheel for the given DataFusion expression
-    ///
-    /// Example: `col("PULocationID").eq(lit(120))`
-    pub fn build_wheel(&self, _expr: Expr) {
-        todo!("Not implemented yet");
+    /// Builds an index using the specified [IndexBuilder]
+    pub async fn build_index(&self, builder: IndexBuilder) -> Result<()> {
+        let batches = self.prep_index_data(&builder).await?;
+        let schema = self.provider.schema();
+
+        // Create a key for this wheel index either using the filter expression or a default STAR_AGGREGATION_ALIAS key
+        let expr_key = builder
+            .filter
+            .as_ref()
+            .map(|f| f.to_string())
+            .unwrap_or(STAR_AGGREGATION_ALIAS.to_string());
+        let col = builder.col.to_string();
+
+        // Build Key for the wheel (table_name.column_name.expr)
+        let expr_key = format!("{}.{}.{}", self.name, col, expr_key);
+
+        match builder.agg_type {
+            AggregateType::Sum => {
+                let wheel = build_uwheel::<F64SumAggregator>(
+                    schema,
+                    &batches,
+                    self.min_timestamp_ms,
+                    self.max_timestamp_ms,
+                    &self.time_column,
+                    &builder.col.to_string(),
+                    &self.haw_conf,
+                )
+                .await?;
+                self.wheels.sum.lock().unwrap().insert(expr_key, wheel);
+            }
+            AggregateType::Avg => {
+                let wheel = build_uwheel::<F64AvgAggregator>(
+                    schema,
+                    &batches,
+                    self.min_timestamp_ms,
+                    self.max_timestamp_ms,
+                    &self.time_column,
+                    &builder.col.to_string(),
+                    &self.haw_conf,
+                )
+                .await?;
+                self.wheels.avg.lock().unwrap().insert(expr_key, wheel);
+            }
+            AggregateType::Min => {
+                let wheel = build_uwheel::<F64MinAggregator>(
+                    schema,
+                    &batches,
+                    self.min_timestamp_ms,
+                    self.max_timestamp_ms,
+                    &self.time_column,
+                    &builder.col.to_string(),
+                    &self.haw_conf,
+                )
+                .await?;
+                self.wheels.min.lock().unwrap().insert(expr_key, wheel);
+            }
+            AggregateType::Max => {
+                let wheel = build_uwheel::<F64MaxAggregator>(
+                    schema,
+                    &batches,
+                    self.min_timestamp_ms,
+                    self.max_timestamp_ms,
+                    &self.time_column,
+                    &builder.col.to_string(),
+                    &self.haw_conf,
+                )
+                .await?;
+                self.wheels.max.lock().unwrap().insert(expr_key, wheel);
+            }
+            AggregateType::All => {
+                let wheel = build_uwheel::<AllAggregator>(
+                    schema,
+                    &batches,
+                    self.min_timestamp_ms,
+                    self.max_timestamp_ms,
+                    &self.time_column,
+                    &builder.col.to_string(),
+                    &self.haw_conf,
+                )
+                .await?;
+                self.wheels.all.lock().unwrap().insert(expr_key, wheel);
+            }
+        }
+        Ok(())
+    }
+
+    // internal helper that takes a index builder and fetches the record batches used to build the index
+    async fn prep_index_data(&self, builder: &IndexBuilder) -> Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        let df = ctx.read_table(self.provider.clone())?;
+
+        // Apply filter if it exists
+        let df = if let Some(filter) = &builder.filter {
+            df.filter(filter.clone())?
+        } else {
+            df
+        };
+        df.collect().await
     }
 }
 
 impl UWheelOptimizer {
-    /// This function takes a logical plan and checks whether it can be optimized using ``uwheel``
+    /// This function takes a logical plan and checks whether it can be optimized using `uwheel`
     ///
-    /// If the plan can be optimized, it returns an optimized execution plan. Otherwise, it returns `None`.
+    /// If the plan can be optimized, it returns an optimized execution plan. Otherwise, it returns `None`
+    /// signaling that the Datafusion's DefaultPlanner should be used.
     pub fn try_optimize(&self, plan: &LogicalPlan) -> Option<Arc<dyn ExecutionPlan>> {
         match plan {
             LogicalPlan::Aggregate(agg) => self.handle_aggregate(agg),
@@ -157,27 +301,36 @@ impl UWheelOptimizer {
                             let range = extract_wheel_range(&filter.predicate, &self.time_column)?;
                             return Some(self.count_exec(range));
                         }
-                        // SUM(col)
-                        Expr::AggregateFunction(agg)
-                            if agg.args.len() == 1
-                                && matches!(
-                                    agg.func_def,
-                                    AggregateFunctionDefinition::BuiltIn(AggregateFunction::Sum)
-                                ) =>
-                        {
+                        // Single Aggregate Function (e.g., SUM(col))
+                        Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
                             if let Expr::Column(col) = &agg.args[0] {
-                                let wheel = self.sum_wheels.lock().unwrap().get(&col.name)?.clone();
-                                let range =
-                                    extract_wheel_range(&filter.predicate, &self.time_column)?;
-                                let table_ref = if let Some(table_ref) = col.relation.as_ref() {
-                                    table_ref.to_quoted_string()
-                                } else {
-                                    "".to_string()
+                                // Fetch temporal filter range and epxr key which is used to identify a wheel
+                                let (range, expr_key) = match extract_filter_expr(
+                                    &filter.predicate,
+                                    &self.time_column,
+                                )? {
+                                    (range, Some(expr)) => {
+                                        (range, maybe_replace_table_name(&expr, &self.name))
+                                    }
+                                    (range, None) => (range, STAR_AGGREGATION_ALIAS.to_string()),
                                 };
-                                let name = format!("SUM({}.{})", table_ref, col.name);
-                                return Some(self.sum_exec(wheel, name, range));
+
+                                // build the key for the wheel
+                                let wheel_key = format!("{}.{}.{}", self.name, col.name, expr_key);
+
+                                let table_ref = col
+                                    .relation
+                                    .as_ref()
+                                    .map(|r| r.to_quoted_string())
+                                    .unwrap_or("".to_string());
+                                let agg_type = Self::func_def_to_aggregate_type(&agg.func_def)?;
+
+                                return self.create_uwheel_exec(
+                                    agg_type, &wheel_key, range, &table_ref, &col.name,
+                                );
                             }
                         }
+
                         _ => (),
                     }
                 }
@@ -205,6 +358,7 @@ impl UWheelOptimizer {
             None
         }
     }
+    // Takes a MinMax filter and possibly returns an empty ExecPlan if the filter indicates that the result is empty
     fn maybe_min_max_filter(
         &self,
         min_max: MinMaxFilter,
@@ -228,6 +382,24 @@ impl UWheelOptimizer {
         maybe_min_max_exec(value, &min_max.predicate.op, min_max_agg, plan)
     }
 
+    fn create_uwheel_exec(
+        &self,
+        agg_type: AggregateType,
+        wheel_key: &str,
+        range: WheelRange,
+        table_ref: &str,
+        column_name: &str,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        match agg_type {
+            AggregateType::Sum => {
+                let wheel = self.wheels.sum.lock().unwrap().get(wheel_key)?.clone();
+                let name = format!("SUM({}.{})", table_ref, column_name);
+                Some(self.sum_exec(wheel, name, range))
+            }
+            _ => None,
+        }
+    }
+
     // helper fn to return a UWheelCount Execution plan
     fn count_exec(&self, range: WheelRange) -> Arc<dyn ExecutionPlan> {
         let name = COUNT_STAR_ALIAS.to_string();
@@ -236,7 +408,11 @@ impl UWheelOptimizer {
             DataType::Int64,
             true,
         )]));
-        Arc::new(UWheelCountExec::new(self.count.clone(), schema, range))
+        Arc::new(UWheelCountExec::new(
+            self.wheels.count.clone(),
+            schema,
+            range,
+        ))
     }
 
     // helper fn to return a UWheelSum Execution plan
@@ -251,8 +427,33 @@ impl UWheelOptimizer {
             DataType::Float64,
             true,
         )]));
-        Arc::new(UWheelSumExec::new(wheel, schema, range))
+        Arc::new(UWheelSumExec::new(wheel, schema, name, range))
     }
+
+    fn func_def_to_aggregate_type(func_def: &AggregateFunctionDefinition) -> Option<AggregateType> {
+        match func_def {
+            AggregateFunctionDefinition::BuiltIn(AggregateFunction::Sum) => {
+                Some(AggregateType::Sum)
+            }
+            AggregateFunctionDefinition::BuiltIn(AggregateFunction::Avg) => {
+                Some(AggregateType::Avg)
+            }
+            AggregateFunctionDefinition::BuiltIn(AggregateFunction::Max) => {
+                Some(AggregateType::Max)
+            }
+            AggregateFunctionDefinition::BuiltIn(AggregateFunction::Min) => {
+                Some(AggregateType::Min)
+            }
+            _ => None,
+        }
+    }
+}
+
+// helper for possibly removing the table name from the expression key
+fn maybe_replace_table_name(expr: &Expr, table_name: &str) -> String {
+    let expr_str = expr.to_string();
+    let replace_key = format!("{}.", table_name);
+    expr_str.replace(&replace_key, "")
 }
 
 // helper function to check whether we can return an empty execution plan based on min/max pruning
@@ -262,10 +463,12 @@ fn maybe_min_max_exec(
     min_max_agg: MinMaxState<f64>,
     plan: &LogicalPlan,
 ) -> Option<Arc<dyn ExecutionPlan>> {
-    if op == &Operator::Gt && min_max_agg.max_value() < value
-        || op == &Operator::GtEq && min_max_agg.max_value() <= value
-        || op == &Operator::Lt && min_max_agg.min_value() > value
-        || op == &Operator::LtEq && min_max_agg.min_value() >= value
+    let max = min_max_agg.max_value();
+    let min = min_max_agg.min_value();
+    if op == &Operator::Gt && max < value
+        || op == &Operator::GtEq && max <= value
+        || op == &Operator::Lt && min > value
+        || op == &Operator::LtEq && min >= value
     {
         Some(Arc::new(EmptyExec::new(Arc::new(
             plan.schema().clone().as_arrow().clone(),
@@ -305,6 +508,8 @@ async fn build(
     sum_columns: Vec<String>,
     haw_conf: &HawConf,
 ) -> Result<(
+    u64,
+    u64,
     ReaderWheel<U32SumAggregator>,
     HashMap<String, ReaderWheel<F64MinMaxAggregator>>,
     HashMap<String, ReaderWheel<F64SumAggregator>>,
@@ -357,7 +562,7 @@ async fn build(
     // Build Sum wheels for specified columns
     let mut sum_map = HashMap::new();
     for column in sum_columns.iter() {
-        let sum_wheel = build_sum_wheel(
+        let sum_wheel = build_uwheel::<F64SumAggregator>(
             provider.schema(),
             &batches,
             min_timestamp_ms,
@@ -370,7 +575,13 @@ async fn build(
         sum_map.insert(column.to_string(), sum_wheel);
     }
 
-    Ok((count_wheel.read().clone(), min_max_map, sum_map))
+    Ok((
+        min_timestamp_ms,
+        max_timestamp_ms,
+        count_wheel.read().clone(),
+        min_max_map,
+        sum_map,
+    ))
 }
 
 async fn build_min_max_wheel(
@@ -437,15 +648,18 @@ async fn build_min_max_wheel(
     Ok(wheel.read().clone())
 }
 
-async fn build_sum_wheel(
+async fn build_uwheel<A>(
     schema: SchemaRef,
     batches: &[RecordBatch],
     _min_timestamp_ms: u64,
     max_timestamp_ms: u64,
     time_col: &str,
-    min_max_col: &str,
+    sum_col: &str,
     haw_conf: &HawConf,
-) -> Result<ReaderWheel<F64SumAggregator>> {
+) -> Result<ReaderWheel<A>>
+where
+    A: Aggregator<Input = f64>,
+{
     // TODO: remove hardcoded time
     let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
     let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
@@ -453,13 +667,13 @@ async fn build_sum_wheel(
 
     let conf = haw_conf.with_watermark(start_ms);
 
-    let mut wheel: RwWheel<F64SumAggregator> = RwWheel::with_conf(
+    let mut wheel: RwWheel<A> = RwWheel::with_conf(
         Conf::default()
             .with_haw_conf(conf)
             .with_write_ahead(64000usize.next_power_of_two()),
     );
 
-    let column_index = schema.index_of(min_max_col)?;
+    let column_index = schema.index_of(sum_col)?;
     let column_field = schema.field(column_index);
 
     if is_numeric_type(column_field.data_type()) {
@@ -471,8 +685,8 @@ async fn build_sum_wheel(
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
 
-            let min_max_column_array = batch
-                .column_by_name(min_max_col)
+            let sum_column_array = batch
+                .column_by_name(sum_col)
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Float64Array>()
@@ -482,7 +696,7 @@ async fn build_sum_wheel(
                 .values()
                 .iter()
                 .copied()
-                .zip(min_max_column_array.values().iter().copied())
+                .zip(sum_column_array.values().iter().copied())
             {
                 let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
                     .unwrap()
