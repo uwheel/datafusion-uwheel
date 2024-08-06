@@ -5,7 +5,7 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion_uwheel::UWheelOptimizer;
+use datafusion_uwheel::{IndexBuilder, UWheelOptimizer};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::Parser;
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     let filename = "../../data/yellow_tripdata_2022-01.parquet";
 
     // register parquet file with the execution context
-    ctx.register_parquet("yellow_tripdata", &filename, ParquetReadOptions::default())
+    ctx.register_parquet("yellow_tripdata", filename, ParquetReadOptions::default())
         .await?;
 
     // Create ctx with UWheelOptimizer
@@ -78,14 +78,24 @@ async fn main() -> Result<()> {
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
             .with_min_max_wheels(vec!["fare_amount", "trip_distance"]) // Create Min/Max wheels for the columns "fare_amount" and "trip_distance"
-            .with_sum_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
             .await
             .unwrap(),
     );
 
-    // Set UWheelOptimizer as the query planner
-    let session_state = uwheel_ctx.state().with_query_planner(optimizer.clone());
+    // Build index on fare_amount using SUM as aggregate
+    optimizer
+        .build_index(IndexBuilder::with_col_and_aggregate(
+            "fare_amount",
+            datafusion_uwheel::AggregateType::Sum,
+        ))
+        .await
+        .unwrap();
+
+    // Set UWheelOptimizer as optimizer rule
+    let session_state = uwheel_ctx
+        .state()
+        .with_optimizer_rules(vec![optimizer.clone()]);
     let uwheel_ctx = SessionContext::new_with_state(session_state);
 
     // Register the table using the underlying provider
@@ -131,33 +141,33 @@ pub async fn bench(
     ranges: &[(u64, u64)],
     fares: &[f64],
 ) {
-    bench_datafusion_count("datafusion-count(*)", &ctx, &ranges).await;
-    bench_datafusion_count("datafusion-uwheel-count(*)", &uwheel_ctx, &ranges).await;
+    bench_datafusion_count("datafusion-count(*)", ctx, ranges).await;
+    bench_datafusion_count("datafusion-uwheel-count(*)", uwheel_ctx, ranges).await;
 
-    bench_datafusion_sum_fare_amount("datafusion-sum(fare_amount)", &ctx, &ranges).await;
-    bench_datafusion_sum_fare_amount("datafusion-uwheel-sum(fare_amount)", &uwheel_ctx, &ranges)
+    bench_datafusion_sum_fare_amount("datafusion-sum(fare_amount)", ctx, ranges).await;
+    bench_datafusion_sum_fare_amount("datafusion-uwheel-sum(fare_amount)", uwheel_ctx, ranges)
         .await;
 
     bench_min_max_projection(
         "datafusion-select(*)-fare-amount-filter",
-        &ctx,
-        &ranges,
-        &fares,
+        ctx,
+        ranges,
+        fares,
     )
     .await;
     bench_min_max_projection(
         "datafusion-uwheel-select(*)-fare-amount-filter",
-        &uwheel_ctx,
-        &ranges,
-        &fares,
+        uwheel_ctx,
+        ranges,
+        fares,
     )
     .await;
 
-    bench_datafusion_temporal_projection("datafusion-select(*)-count-filter", &ctx, &ranges).await;
+    bench_datafusion_temporal_projection("datafusion-select(*)-count-filter", ctx, ranges).await;
     bench_datafusion_temporal_projection(
         "datafusion-uwheel-select(*)-count-filter",
-        &uwheel_ctx,
-        &ranges,
+        uwheel_ctx,
+        ranges,
     )
     .await;
 }
@@ -244,13 +254,11 @@ async fn bench_datafusion_count(id: &str, ctx: &SessionContext, ranges: &[(u64, 
         .map(|(start, end)| {
             let start = DateTime::from_timestamp_millis(start as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             let end = DateTime::from_timestamp_millis(end as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             format!(
                 "SELECT COUNT(*) FROM yellow_tripdata \
@@ -298,18 +306,16 @@ async fn bench_datafusion_sum_fare_amount(id: &str, ctx: &SessionContext, ranges
         .map(|(start, end)| {
             let start = DateTime::from_timestamp_millis(start as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             let end = DateTime::from_timestamp_millis(end as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             format!(
                 "SELECT SUM(fare_amount) FROM yellow_tripdata \
-            WHERE tpep_dropoff_datetime >= '{}' \
-            AND tpep_dropoff_datetime < '{}'",
+                 WHERE tpep_dropoff_datetime >= '{}' \
+                 AND tpep_dropoff_datetime < '{}'",
                 start, end
             )
         })
@@ -358,13 +364,11 @@ async fn bench_min_max_projection(
         .map(|((start, end), fare)| {
             let start = DateTime::from_timestamp_millis(start as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             let end = DateTime::from_timestamp_millis(end as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             format!(
                 "SELECT * FROM yellow_tripdata \
@@ -382,7 +386,7 @@ async fn bench_min_max_projection(
         // dbg!(&query);
         let now = Instant::now();
         let df = ctx.sql(&query).await.unwrap();
-        let res = df.collect().await.unwrap();
+        let _res = df.collect().await.unwrap();
         hist.record(now.elapsed().as_micros() as u64).unwrap();
     }
     let runtime = full.elapsed();
@@ -409,13 +413,11 @@ async fn bench_datafusion_temporal_projection(
         .map(|(start, end)| {
             let start = DateTime::from_timestamp_millis(start as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             let end = DateTime::from_timestamp_millis(end as i64)
                 .unwrap()
-                .to_utc()
-                .naive_utc()
+                .to_rfc3339()
                 .to_string();
             format!(
                 "SELECT * FROM yellow_tripdata \
@@ -432,7 +434,7 @@ async fn bench_datafusion_temporal_projection(
         // dbg!(&query);
         let now = Instant::now();
         let df = ctx.sql(&query).await.unwrap();
-        let res = df.collect().await.unwrap();
+        let _res = df.collect().await.unwrap();
         hist.record(now.elapsed().as_micros() as u64).unwrap();
     }
     let runtime = full.elapsed();

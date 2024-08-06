@@ -6,11 +6,8 @@ edition.workspace = true
 [dependencies]
 datafusion.workspace = true
 uwheel.workspace = true
-async-trait.workspace = true
 chrono.workspace = true
 bitpacking.workspace = true
-futures.workspace = true
-
 
 [dev-dependencies]
 tokio = "1.38.1"

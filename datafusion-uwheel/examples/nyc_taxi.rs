@@ -7,15 +7,11 @@ use datafusion::{
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
     error::Result,
-    physical_plan::{coalesce_batches::CoalesceBatchesExec, collect, empty::EmptyExec},
-    prelude::{col, count, lit, SessionContext},
+    physical_plan::collect,
+    prelude::{col, lit, SessionContext},
     scalar::ScalarValue,
 };
-use datafusion_uwheel::{
-    builder::Builder,
-    exec::{UWheelCountExec, UWheelSumExec},
-    AggregateType, IndexBuilder, UWheelOptimizer,
-};
+use datafusion_uwheel::{builder::Builder, AggregateType, IndexBuilder, UWheelOptimizer};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -47,11 +43,14 @@ async fn main() -> Result<()> {
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
             .with_min_max_wheels(vec!["fare_amount", "trip_distance"])
-            .with_sum_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
             .await
             .unwrap(),
     );
+
+    // Build a wheel SUM on fare_amount
+    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum);
+    optimizer.build_index(builder).await?;
 
     // Build a wheel for a custom expression
     let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
@@ -60,7 +59,7 @@ async fn main() -> Result<()> {
     optimizer.build_index(builder).await?;
 
     // Set UWheelOptimizer as the query planner
-    let session_state = ctx.state().with_query_planner(optimizer.clone());
+    let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
     let ctx = SessionContext::new_with_state(session_state);
 
     // Register the table using the underlying provider
@@ -68,20 +67,15 @@ async fn main() -> Result<()> {
         .unwrap();
 
     // This query will then use the UWheelOptimizer to execute
-    let plan = ctx
+    let df = ctx
         .sql(
             "SELECT COUNT(*) FROM yellow_tripdata
              WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
              AND tpep_dropoff_datetime < '2022-02-01T00:00:00Z'",
         )
-        .await?
-        .create_physical_plan()
         .await?;
 
-    // The plan should be a UWheelCountExec
-    let uwheel_exec = plan.as_any().downcast_ref::<UWheelCountExec>().unwrap();
-    dbg!(uwheel_exec);
-
+    let plan = df.create_physical_plan().await?;
     // Execute the plan
     let results: Vec<RecordBatch> = collect(plan, ctx.task_ctx()).await?;
     arrow::util::pretty::print_batches(&results).unwrap();
@@ -99,7 +93,7 @@ async fn main() -> Result<()> {
     let results: Vec<RecordBatch> = collect(sum_plan, ctx.task_ctx()).await?;
     arrow::util::pretty::print_batches(&results).unwrap();
 
-    let physical_plan = ctx
+    let filter_plan = ctx
         .sql(
             "SELECT * FROM yellow_tripdata
              WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
@@ -109,23 +103,8 @@ async fn main() -> Result<()> {
         .create_physical_plan()
         .await?;
 
-    // Verify that the plan is optimized to EmptyExec
-    assert!(physical_plan.as_any().downcast_ref::<EmptyExec>().is_some());
-
-    let physical_plan = ctx
-        .sql(
-            "SELECT * FROM yellow_tripdata
-             WHERE tpep_dropoff_datetime >= '2022-01-01T00:00:00Z'
-             AND tpep_dropoff_datetime < '2022-01-02T00:00:00Z'",
-        )
-        .await?
-        .create_physical_plan()
-        .await?;
-
-    assert!(physical_plan
-        .as_any()
-        .downcast_ref::<CoalesceBatchesExec>()
-        .is_some());
+    let results: Vec<RecordBatch> = collect(filter_plan, ctx.task_ctx()).await?;
+    arrow::util::pretty::print_batches(&results).unwrap();
 
     let min_max = ctx
         .sql(
@@ -137,25 +116,9 @@ async fn main() -> Result<()> {
         .await?
         .create_physical_plan()
         .await?;
-    // verify that it returned an EmptyExec
-    assert!(min_max.as_any().downcast_ref::<EmptyExec>().is_some());
-
-    let between_plan = ctx
-        .sql(
-            "SELECT COUNT(*) FROM yellow_tripdata
-             WHERE tpep_dropoff_datetime BETWEEN '2022-01-01T00:00:00Z'
-             AND '2022-02-01T00:00:00Z'",
-        )
-        .await?
-        .create_physical_plan()
-        .await?;
-
-    // The plan should be a UWheelCountExec
-    let uwheel_exec = between_plan
-        .as_any()
-        .downcast_ref::<UWheelCountExec>()
-        .unwrap();
-    dbg!(uwheel_exec);
+    let results: Vec<RecordBatch> = collect(min_max, ctx.task_ctx()).await?;
+    assert!(results.is_empty());
+    arrow::util::pretty::print_batches(&results).unwrap();
 
     // We created an index for this SQL query earlier so it execute as a UWheelSumExec
     let sum_keyed_plan = ctx
@@ -168,11 +131,6 @@ async fn main() -> Result<()> {
         .await?
         .create_physical_plan()
         .await?;
-
-    assert!(sum_keyed_plan
-        .as_any()
-        .downcast_ref::<UWheelSumExec>()
-        .is_some());
 
     let results: Vec<RecordBatch> = collect(sum_keyed_plan, ctx.task_ctx()).await?;
     arrow::util::pretty::print_batches(&results).unwrap();

@@ -1,11 +1,14 @@
 use datafusion::{common::Column, prelude::Expr};
-use uwheel::HawConf;
+use uwheel::{wheels::read::aggregation::conf::WheelMode, HawConf};
 
+// Todo: change to UWheelAggregate
+#[derive(Debug, Clone)]
 pub enum AggregateType {
     Sum,
     Avg,
     Min,
     Max,
+    Count,
     All,
 }
 
@@ -28,7 +31,7 @@ impl IndexBuilder {
             col: col.into(),
             agg_type,
             filter: None,
-            conf: Default::default(),
+            conf: Self::default_haw_conf(),
         }
     }
 
@@ -41,6 +44,28 @@ impl IndexBuilder {
     pub fn with_conf(mut self, conf: HawConf) -> Self {
         self.conf = conf;
         self
+    }
+    // helper method to create a default Haw configuration
+    fn default_haw_conf() -> HawConf {
+        // configure Index mode
+        let mut conf = HawConf::default().with_mode(WheelMode::Index);
+        // set the retention policy to keep all data
+
+        conf.seconds
+            .set_retention_policy(uwheel::RetentionPolicy::Keep);
+
+        conf.minutes
+            .set_retention_policy(uwheel::RetentionPolicy::Keep);
+
+        conf.hours
+            .set_retention_policy(uwheel::RetentionPolicy::Keep);
+
+        conf.days
+            .set_retention_policy(uwheel::RetentionPolicy::Keep);
+
+        conf.weeks
+            .set_retention_policy(uwheel::RetentionPolicy::Keep);
+        conf
     }
 }
 

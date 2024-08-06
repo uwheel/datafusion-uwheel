@@ -12,8 +12,6 @@ pub struct Builder {
     time_column: String,
     /// Columns to build min/max wheels for
     min_max_columns: Vec<String>,
-    /// Columns to build sum wheels for
-    sum_columns: Vec<String>,
     /// Default Haw configuration to use when building wheels
     wheel_conf: HawConf,
 }
@@ -25,7 +23,6 @@ impl Builder {
             name: "".to_string(),
             time_column: time_column.into(),
             min_max_columns: Default::default(),
-            sum_columns: Default::default(),
             wheel_conf: Self::default_haw_conf(),
         }
     }
@@ -67,13 +64,6 @@ impl Builder {
         self.min_max_columns = columns.iter().map(|s| s.to_string()).collect();
         self
     }
-    /// Columns to build sum wheels for
-    ///
-    /// Columns must be of numeric data types
-    pub fn with_sum_wheels(mut self, columns: Vec<&str>) -> Self {
-        self.sum_columns = columns.iter().map(|s| s.to_string()).collect();
-        self
-    }
 
     /// Builds the UWheelOptimizer using the provided TableProvider
     pub async fn build_with_provider(
@@ -84,7 +74,6 @@ impl Builder {
             self.name,
             self.time_column,
             self.min_max_columns,
-            self.sum_columns,
             provider,
             self.wheel_conf,
         )

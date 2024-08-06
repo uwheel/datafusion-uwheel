@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use datafusion::{
+    common::Column,
     logical_expr::{BinaryExpr, Operator},
     prelude::Expr,
     scalar::ScalarValue,
@@ -10,6 +11,7 @@ use uwheel::WheelRange;
 pub enum UWheelExpr {
     MinMaxFilter(MinMaxFilter),
     TemporalFilter(Option<i64>, Option<i64>),
+    WheelRange(WheelRange),
 }
 
 /// MinMaxFilter Expr
@@ -32,15 +34,6 @@ pub struct MinMaxPredicate {
     pub scalar: ScalarValue,
 }
 
-/// Attempts to extract a UWheelExpr from a Datafusion expr
-pub fn extract_uwheel_expr(predicate: &Expr, time_column: &str) -> Option<UWheelExpr> {
-    match predicate {
-        Expr::BinaryExpr(binary_expr) => handle_binary_expr(binary_expr, time_column),
-        Expr::Between(_between) => unimplemented!(), //handle_between(between, time_column),
-        _ => None,
-    }
-}
-
 // Tries to extract a temporal filter from a Datafusion expr that matches the `time_column`
 pub fn extract_wheel_range(predicate: &Expr, time_column: &str) -> Option<WheelRange> {
     extract_uwheel_expr(predicate, time_column).and_then(|expr| {
@@ -56,24 +49,49 @@ pub fn extract_wheel_range(predicate: &Expr, time_column: &str) -> Option<WheelR
     })
 }
 
+// Converts a TemporalFilter expr to WheelRange
+fn filter_to_range(start: Option<i64>, end: Option<i64>) -> Option<WheelRange> {
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            if start > end {
+                None
+            } else {
+                WheelRange::new(start as u64, end as u64).ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Attempts to extract a UWheelExpr from a Datafusion expr
+pub fn extract_uwheel_expr(predicate: &Expr, time_column: &str) -> Option<UWheelExpr> {
+    match predicate {
+        Expr::BinaryExpr(binary_expr) => handle_binary_expr(binary_expr, time_column),
+        Expr::Between(_between) => unimplemented!(), //handle_between(between, time_column),
+        _ => None,
+    }
+}
+
 /// Attemps to extract a MinMaxPredicate from a Datafusion expr
 pub fn extract_min_max_predicate(predicate: &Expr) -> Option<MinMaxPredicate> {
     match predicate {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             if let Expr::Column(col) = left.as_ref() {
                 // check if the right side is a literal
-                if let Expr::Literal(scalar) = right.as_ref() {
-                    // check if the operator is a comparison operator
-                    if op == &Operator::Gt
-                        || op == &Operator::GtEq
-                        || op == &Operator::Lt
-                        || op == &Operator::LtEq
-                    {
-                        return Some(MinMaxPredicate {
-                            name: col.name.clone(),
-                            op: *op,
-                            scalar: scalar.clone(),
-                        });
+                if let Expr::Cast(cast) = right.as_ref() {
+                    if let Expr::Literal(scalar) = cast.expr.as_ref() {
+                        // check if the operator is a comparison operator
+                        if op == &Operator::Gt
+                            || op == &Operator::GtEq
+                            || op == &Operator::Lt
+                            || op == &Operator::LtEq
+                        {
+                            return Some(MinMaxPredicate {
+                                name: col.name.clone(),
+                                op: *op,
+                                scalar: scalar.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -152,10 +170,9 @@ fn extract_min_max_filter(
 fn handle_and_operator(left: &Expr, right: &Expr, time_column: &str) -> Option<UWheelExpr> {
     let left_range = extract_uwheel_expr(left, time_column);
     let right_range = extract_uwheel_expr(right, time_column);
-
     match (left_range, right_range) {
         (Some(UWheelExpr::TemporalFilter(start, _)), Some(UWheelExpr::TemporalFilter(_, end))) => {
-            Some(UWheelExpr::TemporalFilter(start, end))
+            filter_to_range(start, end).map(UWheelExpr::WheelRange)
         }
         _ => None,
     }
@@ -167,22 +184,31 @@ fn handle_comparison_operator(
     right: &Expr,
     time_column: &str,
 ) -> Option<UWheelExpr> {
-    if let Expr::Column(col) = left {
-        if col.name == time_column {
-            match op {
-                Operator::GtEq | Operator::Gt => {
-                    extract_timestamp(right).map(|ts| UWheelExpr::TemporalFilter(Some(ts), None))
+    let handle_col =
+        |col: &Column| {
+            if col.name == time_column {
+                match op {
+                    Operator::GtEq | Operator::Gt => extract_timestamp(right)
+                        .map(|ts| UWheelExpr::TemporalFilter(Some(ts), None)),
+                    Operator::Lt | Operator::LtEq => extract_timestamp(right)
+                        .map(|ts| UWheelExpr::TemporalFilter(None, Some(ts))),
+                    _ => None,
                 }
-                Operator::Lt | Operator::LtEq => {
-                    extract_timestamp(right).map(|ts| UWheelExpr::TemporalFilter(None, Some(ts)))
-                }
-                _ => None,
+            } else {
+                None
             }
-        } else {
-            None
+        };
+
+    match left {
+        Expr::Cast(cast) => {
+            if let Expr::Column(col) = cast.expr.as_ref() {
+                handle_col(col)
+            } else {
+                None
+            }
         }
-    } else {
-        None
+        Expr::Column(col) => handle_col(col),
+        _ => None,
     }
 }
 
@@ -196,8 +222,9 @@ fn extract_timestamp(expr: &Expr) -> Option<i64> {
         Expr::Literal(ScalarValue::TimestampNanosecond(Some(ns), _)) => {
             Some(ns / 1_000_000) // Convert nanoseconds to milliseconds
         }
+        Expr::Cast(cast) => extract_timestamp(&cast.expr),
         // Add other cases as needed, e.g., for different date/time formats
-        _ => None,
+        _ => panic!("Unsupported expression: {:?}", expr),
     }
 }
 
@@ -241,10 +268,10 @@ mod tests {
         let result = extract_uwheel_expr(&expr, "timestamp");
         assert_eq!(
             result,
-            Some(UWheelExpr::TemporalFilter(
-                Some(create_timestamp("2023-01-01T00:00:00Z")),
-                Some(create_timestamp("2023-12-31T23:59:59Z"))
-            ))
+            Some(UWheelExpr::WheelRange(WheelRange::new_unchecked(
+                create_timestamp("2023-01-01T00:00:00Z") as u64,
+                create_timestamp("2023-12-31T23:59:59Z") as u64
+            ))),
         );
     }
     #[test]
