@@ -30,7 +30,11 @@ impl Builder {
     fn default_haw_conf() -> HawConf {
         // configure Index mode
         let mut conf = HawConf::default().with_mode(WheelMode::Index);
-        // set the retention policy to keep all data
+        // set the retention policy to keep all data on all time dimensions
+
+        conf.seconds
+            .set_retention_policy(uwheel::RetentionPolicy::Keep);
+
         conf.minutes
             .set_retention_policy(uwheel::RetentionPolicy::Keep);
 

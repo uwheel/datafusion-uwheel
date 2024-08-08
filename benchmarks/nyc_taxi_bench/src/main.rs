@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     let optimizer: Arc<UWheelOptimizer> = Arc::new(
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
-            .with_min_max_wheels(vec!["fare_amount", "trip_distance"]) // Create Min/Max wheels for the columns "fare_amount" and "trip_distance"
+            .with_min_max_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
             .await
             .unwrap(),
@@ -118,6 +118,11 @@ async fn main() -> Result<()> {
     let random_fare_amounts: Vec<f64> = (0..args.queries)
         .map(|_| fastrand::u64(500..1000) as f64)
         .collect();
+
+    println!(
+        "Index size usage: {}",
+        human_bytes::human_bytes(optimizer.index_usage_bytes() as u32)
+    );
 
     println!("===== SECOND RANGES =====");
 
@@ -421,8 +426,8 @@ async fn bench_datafusion_temporal_projection(
                 .to_string();
             format!(
                 "SELECT * FROM yellow_tripdata \
-            WHERE tpep_dropoff_datetime >= '{}' \
-            AND tpep_dropoff_datetime < '{}'",
+                 WHERE tpep_dropoff_datetime >= '{}' \
+                 AND tpep_dropoff_datetime < '{}'",
                 start, end
             )
         })

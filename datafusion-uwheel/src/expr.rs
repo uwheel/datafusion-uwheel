@@ -36,17 +36,10 @@ pub struct MinMaxPredicate {
 
 // Tries to extract a temporal filter from a Datafusion expr that matches the `time_column`
 pub fn extract_wheel_range(predicate: &Expr, time_column: &str) -> Option<WheelRange> {
-    extract_uwheel_expr(predicate, time_column).and_then(|expr| {
-        if let UWheelExpr::TemporalFilter(Some(start), Some(end)) = expr {
-            if start > end {
-                None
-            } else {
-                WheelRange::new(start as u64, end as u64).ok()
-            }
-        } else {
-            None
-        }
-    })
+    match extract_uwheel_expr(predicate, time_column) {
+        Some(UWheelExpr::WheelRange(range)) => Some(range),
+        _ => None,
+    }
 }
 
 // Converts a TemporalFilter expr to WheelRange

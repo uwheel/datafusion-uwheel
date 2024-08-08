@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let optimizer: Arc<UWheelOptimizer> = Arc::new(
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
-            .with_min_max_wheels(vec!["fare_amount", "trip_distance"])
+            .with_min_max_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
             .await
             .unwrap(),
@@ -134,6 +134,11 @@ async fn main() -> Result<()> {
 
     let results: Vec<RecordBatch> = collect(sum_keyed_plan, ctx.task_ctx()).await?;
     arrow::util::pretty::print_batches(&results).unwrap();
+
+    println!(
+        "Index size usage: {}",
+        human_bytes::human_bytes(optimizer.index_usage_bytes() as u32)
+    );
 
     Ok(())
 }

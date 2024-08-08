@@ -87,6 +87,55 @@ impl BuiltInWheels {
             all: Default::default(),
         }
     }
+    /// Returns the total number of bytes used by all wheel indices
+    fn index_usage_bytes(&self) -> usize {
+        let mut bytes = 0;
+        bytes += self.count.as_ref().size_bytes();
+        bytes += self
+            .min_max
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.as_ref().size_bytes())
+            .sum::<usize>();
+        bytes += self
+            .avg
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.as_ref().size_bytes())
+            .sum::<usize>();
+        bytes += self
+            .sum
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.as_ref().size_bytes())
+            .sum::<usize>();
+        bytes += self
+            .min
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.as_ref().size_bytes())
+            .sum::<usize>();
+        bytes += self
+            .max
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.as_ref().size_bytes())
+            .sum::<usize>();
+        bytes += self
+            .all
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.as_ref().size_bytes())
+            .sum::<usize>();
+
+        bytes
+    }
 }
 
 /// A µWheel optimizer for DataFusion that indexes wheels for time-based analytical queries.
@@ -153,6 +202,11 @@ impl UWheelOptimizer {
     #[inline]
     pub fn count_wheel(&self) -> &ReaderWheel<U32SumAggregator> {
         &self.wheels.count
+    }
+
+    /// Returns the total number of bytes used by all wheel indices
+    pub fn index_usage_bytes(&self) -> usize {
+        self.wheels.index_usage_bytes()
     }
 
     /// Returns a reference to a MIN/MAX wheel for a specified column
@@ -295,9 +349,11 @@ impl UWheelOptimizer {
                     match agg_expr {
                         // COUNT(*)
                         Expr::Alias(alias) if alias.name == COUNT_STAR_ALIAS => {
+                            // extract possible time range filter
                             let range = extract_wheel_range(&filter.predicate, &self.time_column)?;
+                            let count = self.count(range)?; // early return if range is not queryable
                             let schema = Arc::new(plan.schema().clone().as_arrow().clone());
-                            self.count_scan(schema, range).ok()
+                            count_scan(count, schema).ok()
                         }
                         // Single Aggregate Function (e.g., SUM(col))
                         Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
@@ -338,7 +394,7 @@ impl UWheelOptimizer {
     // Attemps to rewrite a top-level Filter plan
     fn try_rewrite_filter(&self, filter: &Filter, plan: &LogicalPlan) -> Option<LogicalPlan> {
         // The optimizer supports two types of filtering
-        // 1. count-based using COUNT(*) on the Count wheel
+        // 1. count-based using the Count wheel
         // 2. min-max filtering using a MinMax wheel
 
         match extract_uwheel_expr(&filter.predicate, &self.time_column) {
@@ -350,10 +406,11 @@ impl UWheelOptimizer {
         }
     }
 
+    // Queries the range using the count wheel, returning a empty table scan if the count is 0
+    // avoiding the need to generate a regular execution plan..
     fn maybe_count_filter(&self, range: WheelRange, plan: &LogicalPlan) -> Option<LogicalPlan> {
         let count = self.count(range)?; // early return if range can't be queried
 
-        // query the wheel and if count == 0 then return empty table scan
         if count == 0 {
             let schema = Arc::new(plan.schema().clone().as_arrow().clone());
             let table_ref = extract_table_reference(plan)?;
@@ -363,7 +420,7 @@ impl UWheelOptimizer {
         }
     }
 
-    // Takes a MinMax filter and possibly returns an Empty an empty TableScan if the filter indicates that the result is empty
+    // Takes a MinMax filter and possibly returns an empty TableScan if the filter indicates that the result is empty
     fn maybe_min_max_filter(
         &self,
         min_max: MinMaxFilter,
@@ -405,41 +462,40 @@ impl UWheelOptimizer {
         match agg_type {
             AggregateType::Sum => {
                 let wheel = self.wheels.sum.lock().unwrap().get(wheel_key)?.clone();
-                let result = wheel.combine_range_and_lower(range).unwrap_or(0.0);
+                let result = wheel.combine_range_and_lower(range)?;
                 uwheel_agg_to_table_scan(result, schema).ok()
             }
             AggregateType::Avg => {
                 let wheel = self.wheels.avg.lock().unwrap().get(wheel_key)?.clone();
                 let result = wheel
                     .combine_range_and_lower(range)
-                    .map(F64AvgAggregator::lower) // # Replace when fixed: https://github.com/uwheel/uwheel/issues/140
-                    .unwrap_or(0.0);
+                    .map(F64AvgAggregator::lower)?; // # Replace when fixed: https://github.com/uwheel/uwheel/issues/140
+
                 uwheel_agg_to_table_scan(result, schema).ok()
             }
             AggregateType::Min => {
                 let wheel = self.wheels.min.lock().unwrap().get(wheel_key)?.clone();
-                let result = wheel.combine_range_and_lower(range).unwrap_or(0.0);
+                let result = wheel.combine_range_and_lower(range)?;
                 uwheel_agg_to_table_scan(result, schema).ok()
             }
             AggregateType::Max => {
                 let wheel = self.wheels.max.lock().unwrap().get(wheel_key)?.clone();
-                let result = wheel.combine_range_and_lower(range).unwrap_or(0.0);
+                let result = wheel.combine_range_and_lower(range)?;
                 uwheel_agg_to_table_scan(result, schema).ok()
             }
             _ => unimplemented!(),
         }
     }
+}
 
-    fn count_scan(&self, schema: SchemaRef, range: WheelRange) -> Result<LogicalPlan> {
-        let count = self.count(range).unwrap_or(0);
-        let name = COUNT_STAR_ALIAS.to_string();
-        let data = Int64Array::from(vec![count as i64]);
-        let record_batch = RecordBatch::try_from_iter(vec![(&name, Arc::new(data) as ArrayRef)])?;
-        let df_schema = Arc::new(DFSchema::try_from(schema.clone())?);
-        let mem_table = MemTable::try_new(schema, vec![vec![record_batch]])?;
+fn count_scan(count: u32, schema: SchemaRef) -> Result<LogicalPlan> {
+    let name = COUNT_STAR_ALIAS.to_string();
+    let data = Int64Array::from(vec![count as i64]);
+    let record_batch = RecordBatch::try_from_iter(vec![(&name, Arc::new(data) as ArrayRef)])?;
+    let df_schema = Arc::new(DFSchema::try_from(schema.clone())?);
+    let mem_table = MemTable::try_new(schema, vec![vec![record_batch]])?;
 
-        mem_table_as_table_scan(mem_table, df_schema)
-    }
+    mem_table_as_table_scan(mem_table, df_schema)
 }
 
 // Converts a uwheel aggregate result to a TableScan with a MemTable as source

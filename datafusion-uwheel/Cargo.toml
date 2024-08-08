@@ -11,3 +11,4 @@ bitpacking.workspace = true
 
 [dev-dependencies]
 tokio = "1.38.1"
+human_bytes = "0.4"
