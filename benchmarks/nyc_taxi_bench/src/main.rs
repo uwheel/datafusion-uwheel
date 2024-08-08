@@ -120,7 +120,23 @@ async fn main() -> Result<()> {
         .collect();
 
     println!(
-        "Index size usage: {}",
+        "Count Wheel index size usage: {}",
+        human_bytes::human_bytes(optimizer.count_wheel().as_ref().size_bytes() as u32)
+    );
+
+    println!(
+        "Fare amount MinMax index size usage: {}",
+        human_bytes::human_bytes(
+            optimizer
+                .min_max_wheel("fare_amount")
+                .unwrap()
+                .as_ref()
+                .size_bytes() as u32
+        )
+    );
+
+    println!(
+        "Total Index size usage: {}",
         human_bytes::human_bytes(optimizer.index_usage_bytes() as u32)
     );
 
