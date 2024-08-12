@@ -1,5 +1,7 @@
-use datafusion::{common::Column, prelude::Expr};
+use datafusion::{common::Column, error::DataFusionError, prelude::Expr, scalar::ScalarValue};
 use uwheel::{wheels::read::aggregation::conf::WheelMode, HawConf};
+
+use crate::scalar_to_timestamp;
 
 // Todo: change to UWheelAggregate
 #[derive(Debug, Clone)]
@@ -22,6 +24,8 @@ pub struct IndexBuilder {
     pub filter: Option<Expr>,
     /// Wheel configuration
     pub conf: HawConf,
+    /// Optional time range to apply to the the index building
+    pub time_range: Option<(ScalarValue, ScalarValue)>,
 }
 
 impl IndexBuilder {
@@ -32,6 +36,26 @@ impl IndexBuilder {
             agg_type,
             filter: None,
             conf: Self::default_haw_conf(),
+            time_range: None,
+        }
+    }
+
+    /// Applies a time range when building the index
+    ///
+    /// Input must be a ScalarValue of type Date32, Date64 or Timestamp
+    pub fn with_time_range(
+        mut self,
+        start: ScalarValue,
+        end: ScalarValue,
+    ) -> Result<Self, DataFusionError> {
+        match (scalar_to_timestamp(&start), scalar_to_timestamp(&end)) {
+            (Some(_), Some(_)) => {
+                self.time_range = Some((start, end));
+                Ok(self)
+            }
+            _ => Err(DataFusionError::Internal(
+                "Not valid time range data types, must be Date32, Date64, or Timestamp".to_string(),
+            )),
         }
     }
 
@@ -86,5 +110,26 @@ mod tests {
         let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
             .with_filter(col("id").eq(lit(1)));
         assert_eq!(builder.filter.unwrap().to_string(), "id = Int32(1)");
+    }
+
+    #[test]
+    fn test_index_builder_with_time_range() {
+        assert!(
+            IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
+                .with_time_range(
+                    ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
+                    ScalarValue::Utf8(Some("2022-02-01T00:00:00Z".to_string())),
+                )
+                .is_ok()
+        );
+
+        assert!(
+            IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
+                .with_time_range(
+                    ScalarValue::Int32(Some(10000)),
+                    ScalarValue::Int32(Some(10000))
+                )
+                .is_err()
+        );
     }
 }

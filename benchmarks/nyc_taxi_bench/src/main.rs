@@ -5,11 +5,12 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::scalar::ScalarValue;
 use datafusion_uwheel::{IndexBuilder, UWheelOptimizer};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::Parser;
-use datafusion::arrow::array::AsArray;
+use datafusion::arrow::array::{ArrowPrimitiveType, AsArray};
 use datafusion::arrow::datatypes::{Float64Type, Int64Type};
 use datafusion::error::Result;
 use datafusion::prelude::*;
@@ -78,6 +79,10 @@ async fn main() -> Result<()> {
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
             .with_min_max_wheels(vec!["fare_amount"])
+            .with_time_range(
+                ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
+                ScalarValue::Utf8(Some("2022-02-01T00:00:00Z".to_string())),
+            )?
             .build_with_provider(provider)
             .await
             .unwrap(),
@@ -85,12 +90,33 @@ async fn main() -> Result<()> {
 
     // Build index on fare_amount using SUM as aggregate
     optimizer
-        .build_index(IndexBuilder::with_col_and_aggregate(
-            "fare_amount",
-            datafusion_uwheel::AggregateType::Sum,
-        ))
+        .build_index(
+            IndexBuilder::with_col_and_aggregate(
+                "fare_amount",
+                datafusion_uwheel::AggregateType::Sum,
+            )
+            .with_time_range(
+                ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
+                ScalarValue::Utf8(Some("2022-02-01T00:00:00Z".to_string())),
+            )?,
+        )
         .await
         .unwrap();
+
+    // Build index on fare_amount using SUM as aggregate with a filter on passenger_count = 3
+    optimizer
+        .build_index(
+            IndexBuilder::with_col_and_aggregate(
+                "fare_amount",
+                datafusion_uwheel::AggregateType::Sum,
+            )
+            .with_filter(col("passenger_count").eq(lit(3.0)))
+            .with_time_range(
+                ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
+                ScalarValue::Utf8(Some("2022-02-01T00:00:00Z".to_string())),
+            )?,
+        )
+        .await?;
 
     // Set UWheelOptimizer as optimizer rule
     let session_state = uwheel_ctx
@@ -168,6 +194,14 @@ pub async fn bench(
     bench_datafusion_sum_fare_amount("datafusion-sum(fare_amount)", ctx, ranges).await;
     bench_datafusion_sum_fare_amount("datafusion-uwheel-sum(fare_amount)", uwheel_ctx, ranges)
         .await;
+
+    bench_keyed_sum("datafusion-sum(fare_amount)-keyed", ctx, ranges).await;
+    bench_keyed_sum(
+        "datafusion-uwheel-sum(fare_amount)-keyed",
+        uwheel_ctx,
+        ranges,
+    )
+    .await;
 
     bench_min_max_projection(
         "datafusion-select(*)-fare-amount-filter",
@@ -289,35 +323,8 @@ async fn bench_datafusion_count(id: &str, ctx: &SessionContext, ranges: &[(u64, 
             )
         })
         .collect();
-    let mut hist = hdrhistogram::Histogram::<u64>::new(4).unwrap();
-    let full = Instant::now();
 
-    for query in queries {
-        // dbg!(&query);
-        let now = Instant::now();
-        let df = ctx.sql(&query).await.unwrap();
-        let res = df.collect().await.unwrap();
-        hist.record(now.elapsed().as_micros() as u64).unwrap();
-        let _count: i64 = res[0]
-            .project(&[0])
-            .unwrap()
-            .column(0)
-            .as_primitive::<Int64Type>()
-            .value(0);
-        #[cfg(feature = "debug")]
-        dbg!(_count);
-    }
-    let runtime = full.elapsed();
-
-    println!(
-        "{:?} Executed {} queries with {:.2}QPS took {:?}",
-        id,
-        ranges.len(),
-        (ranges.len() as f64 / runtime.as_secs_f64()),
-        runtime
-    );
-
-    print_hist(id, &hist);
+    bench_exec_single_value::<Int64Type>(id, ctx, &queries).await;
 }
 
 async fn bench_datafusion_sum_fare_amount(id: &str, ctx: &SessionContext, ranges: &[(u64, u64)]) {
@@ -341,35 +348,34 @@ async fn bench_datafusion_sum_fare_amount(id: &str, ctx: &SessionContext, ranges
             )
         })
         .collect();
-    let mut hist = hdrhistogram::Histogram::<u64>::new(4).unwrap();
-    let full = Instant::now();
 
-    for query in queries {
-        // dbg!(&query);
-        let now = Instant::now();
-        let df = ctx.sql(&query).await.unwrap();
-        let res = df.collect().await.unwrap();
-        hist.record(now.elapsed().as_micros() as u64).unwrap();
-        let _sum: f64 = res[0]
-            .project(&[0])
-            .unwrap()
-            .column(0)
-            .as_primitive::<Float64Type>()
-            .value(0);
-        #[cfg(feature = "debug")]
-        dbg!(_sum);
-    }
-    let runtime = full.elapsed();
+    bench_exec_single_value::<Float64Type>(id, ctx, &queries).await;
+}
 
-    println!(
-        "{:?} Executed {} queries with {:.2}QPS took {:?}",
-        id,
-        ranges.len(),
-        (ranges.len() as f64 / runtime.as_secs_f64()),
-        runtime
-    );
+async fn bench_keyed_sum(id: &str, ctx: &SessionContext, ranges: &[(u64, u64)]) {
+    let queries: Vec<_> = ranges
+        .iter()
+        .copied()
+        .map(|(start, end)| {
+            let start = DateTime::from_timestamp_millis(start as i64)
+                .unwrap()
+                .to_rfc3339()
+                .to_string();
+            let end = DateTime::from_timestamp_millis(end as i64)
+                .unwrap()
+                .to_rfc3339()
+                .to_string();
+            format!(
+                "SELECT SUM(fare_amount) FROM yellow_tripdata \
+                 WHERE tpep_dropoff_datetime >= '{}' \
+                 AND tpep_dropoff_datetime < '{}'
+                 AND passenger_count = 3.0", // We created index for this above
+                start, end
+            )
+        })
+        .collect();
 
-    print_hist(id, &hist);
+    bench_exec_single_value::<Float64Type>(id, ctx, &queries).await;
 }
 
 async fn bench_min_max_projection(
@@ -400,27 +406,8 @@ async fn bench_min_max_projection(
             )
         })
         .collect();
-    let mut hist = hdrhistogram::Histogram::<u64>::new(4).unwrap();
-    let full = Instant::now();
 
-    for query in queries {
-        // dbg!(&query);
-        let now = Instant::now();
-        let df = ctx.sql(&query).await.unwrap();
-        let _res = df.collect().await.unwrap();
-        hist.record(now.elapsed().as_micros() as u64).unwrap();
-    }
-    let runtime = full.elapsed();
-
-    println!(
-        "{:?} Executed {} queries with {:.2}QPS took {:?}",
-        id,
-        ranges.len(),
-        (ranges.len() as f64 / runtime.as_secs_f64()),
-        runtime
-    );
-
-    print_hist(id, &hist);
+    bench_exec(id, ctx, &queries).await;
 }
 
 async fn bench_datafusion_temporal_projection(
@@ -448,13 +435,18 @@ async fn bench_datafusion_temporal_projection(
             )
         })
         .collect();
+
+    bench_exec(id, ctx, &queries).await;
+}
+
+async fn bench_exec(id: &str, ctx: &SessionContext, queries: &[String]) {
     let mut hist = hdrhistogram::Histogram::<u64>::new(4).unwrap();
     let full = Instant::now();
 
     for query in queries {
         // dbg!(&query);
         let now = Instant::now();
-        let df = ctx.sql(&query).await.unwrap();
+        let df = ctx.sql(query).await.unwrap();
         let _res = df.collect().await.unwrap();
         hist.record(now.elapsed().as_micros() as u64).unwrap();
     }
@@ -463,8 +455,44 @@ async fn bench_datafusion_temporal_projection(
     println!(
         "{:?} Executed {} queries with {:.2}QPS took {:?}",
         id,
-        ranges.len(),
-        (ranges.len() as f64 / runtime.as_secs_f64()),
+        queries.len(),
+        (queries.len() as f64 / runtime.as_secs_f64()),
+        runtime
+    );
+
+    print_hist(id, &hist);
+}
+
+async fn bench_exec_single_value<T: ArrowPrimitiveType + std::fmt::Debug>(
+    id: &str,
+    ctx: &SessionContext,
+    queries: &[String],
+) {
+    let mut hist = hdrhistogram::Histogram::<u64>::new(4).unwrap();
+    let full = Instant::now();
+
+    for query in queries {
+        // dbg!(&query);
+        let now = Instant::now();
+        let df = ctx.sql(query).await.unwrap();
+        let res = df.collect().await.unwrap();
+        hist.record(now.elapsed().as_micros() as u64).unwrap();
+        let _sum: T::Native = res[0]
+            .project(&[0])
+            .unwrap()
+            .column(0)
+            .as_primitive::<T>()
+            .value(0);
+        #[cfg(feature = "debug")]
+        dbg!(_sum);
+    }
+    let runtime = full.elapsed();
+
+    println!(
+        "{:?} Executed {} queries with {:.2}QPS took {:?}",
+        id,
+        queries.len(),
+        (queries.len() as f64 / runtime.as_secs_f64()),
         runtime
     );
 

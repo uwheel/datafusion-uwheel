@@ -18,7 +18,6 @@ graph TD
     F -->|builds| C
 ```
 
-
 ## Preliminary Results
 
 The following results are based on the [nyc_taxi_bench](benchmarks/nyc_taxi_bench) and were executed on a Macbook Pro M2.
@@ -48,7 +47,38 @@ AND tpep_dropoff_datetime < '{}'",
 The optimizer significantly reduces query latencies by using a Count wheel index that is configured
 with prefix-enabled wheels enabling any range to be queried in constant time.
 
-**Index size usage:** 92.4 MiB
+**Index size usage:** 20.8 MiB
+
+### Keyed SUM Aggregation
+
+```sql
+SELECT SUM(fare_amount) FROM yellow_tripdata \
+WHERE tpep_dropoff_datetime >= '{}' \
+AND tpep_dropoff_datetime < '{}'
+AND passenger_count = 3.0",
+```
+
+This index is built through the following API code:
+
+```rust
+optimizer
+  .build_index(
+    IndexBuilder::with_col_and_aggregate(
+      "fare_amount",
+      AggregateType::Sum,
+    )
+    .with_filter(col("passenger_count").eq(lit(3.0)))
+   ).await?;
+```
+
+| System     | p50 | p99 | p99.9 |
+| ---------- | --- | --- | --- |
+| datafusion (Second Ranges) | 72447µs | 76971µs | 80787µs |
+| datafusion (Minute Ranges) | 72355µs | 73319µs | 76159µs |
+| datafusion-uwheel (Second Ranges)    | **62µs**   | **74µs**   | **256µs**   |
+| datafusion-uwheel (Minute Ranges)    | **65µs**   | **84µs**   | **165µs**   |
+
+**Index size usage:** 41.6 MiB
 
 ### MinMax Filtering
 
@@ -69,4 +99,4 @@ AND fare_amount > {}",
 As seen by the p50 latency, the optimizer is able to skip query processing on certain temporal ranges and fare amounts
 through the use of MinMax wheel indices.
 
-**Index size usage:** 184.8 MiB
+**Index size usage:** 41.6 MiB

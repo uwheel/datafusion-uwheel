@@ -42,14 +42,23 @@ async fn main() -> Result<()> {
     let optimizer: Arc<UWheelOptimizer> = Arc::new(
         Builder::new("tpep_dropoff_datetime")
             .with_name("yellow_tripdata")
+            .with_time_range(
+                ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
+                ScalarValue::Utf8(Some("2022-02-01T00:00:00Z".to_string())),
+            )?
             .with_min_max_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
             .await
             .unwrap(),
     );
 
-    // Build a wheel SUM on fare_amount
-    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum);
+    // Build a wheel SUM on fare_amount for certain days
+    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
+        .with_time_range(
+            ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
+            ScalarValue::Utf8(Some("2022-01-03T00:00:00Z".to_string())),
+        )?;
+
     optimizer.build_index(builder).await?;
 
     // Build a wheel for a custom expression

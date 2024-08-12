@@ -12,13 +12,11 @@ use datafusion::{
     },
     common::{tree_node::Transformed, DFSchema, DFSchemaRef},
     datasource::{provider_as_source, MemTable, TableProvider},
-    execution::TaskContext,
     logical_expr::{
         expr::AggregateFunctionDefinition, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
         Projection, TableScan,
     },
     optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
-    physical_plan::common::collect,
     prelude::*,
     scalar::ScalarValue,
     sql::TableReference,
@@ -165,12 +163,19 @@ impl UWheelOptimizer {
         min_max_columns: Vec<String>,
         provider: Arc<dyn TableProvider>,
         haw_conf: HawConf,
+        time_range: Option<(ScalarValue, ScalarValue)>,
     ) -> Result<Self> {
         let time_column = time_column.into();
 
         // Create an initial instance of the UWheelOptimizer
-        let (min_timestamp_ms, max_timestamp_ms, count, min_max_wheels) =
-            build(provider.clone(), &time_column, min_max_columns, &haw_conf).await?;
+        let (min_timestamp_ms, max_timestamp_ms, count, min_max_wheels) = build(
+            provider.clone(),
+            &time_column,
+            min_max_columns,
+            &haw_conf,
+            time_range,
+        )
+        .await?;
         let min_max_wheels = Arc::new(Mutex::new(min_max_wheels));
         let wheels = BuiltInWheels::new(count, min_max_wheels);
 
@@ -216,7 +221,13 @@ impl UWheelOptimizer {
 
     /// Builds an index using the specified [IndexBuilder]
     pub async fn build_index(&self, builder: IndexBuilder) -> Result<()> {
-        let batches = self.prep_index_data(&builder).await?;
+        let batches = prep_index_data(
+            &self.time_column,
+            self.provider.clone(),
+            &builder.filter,
+            &builder.time_range,
+        )
+        .await?;
         let schema = self.provider.schema();
 
         // Create a key for this wheel index either using the filter expression or a default STAR_AGGREGATION_ALIAS key
@@ -238,8 +249,7 @@ impl UWheelOptimizer {
                     self.min_timestamp_ms,
                     self.max_timestamp_ms,
                     &self.time_column,
-                    &builder.col.to_string(),
-                    &builder.conf,
+                    &builder,
                 )
                 .await?;
                 self.wheels.sum.lock().unwrap().insert(expr_key, wheel);
@@ -251,8 +261,7 @@ impl UWheelOptimizer {
                     self.min_timestamp_ms,
                     self.max_timestamp_ms,
                     &self.time_column,
-                    &builder.col.to_string(),
-                    &builder.conf,
+                    &builder,
                 )
                 .await?;
                 self.wheels.avg.lock().unwrap().insert(expr_key, wheel);
@@ -264,8 +273,7 @@ impl UWheelOptimizer {
                     self.min_timestamp_ms,
                     self.max_timestamp_ms,
                     &self.time_column,
-                    &builder.col.to_string(),
-                    &builder.conf,
+                    &builder,
                 )
                 .await?;
                 self.wheels.min.lock().unwrap().insert(expr_key, wheel);
@@ -277,8 +285,7 @@ impl UWheelOptimizer {
                     self.min_timestamp_ms,
                     self.max_timestamp_ms,
                     &self.time_column,
-                    &builder.col.to_string(),
-                    &builder.conf,
+                    &builder,
                 )
                 .await?;
                 self.wheels.max.lock().unwrap().insert(expr_key, wheel);
@@ -290,8 +297,7 @@ impl UWheelOptimizer {
                     self.min_timestamp_ms,
                     self.max_timestamp_ms,
                     &self.time_column,
-                    &builder.col.to_string(),
-                    &builder.conf,
+                    &builder,
                 )
                 .await?;
                 self.wheels.all.lock().unwrap().insert(expr_key, wheel);
@@ -299,20 +305,6 @@ impl UWheelOptimizer {
             _ => unimplemented!(),
         }
         Ok(())
-    }
-
-    // internal helper that takes a index builder and fetches the record batches used to build the index
-    async fn prep_index_data(&self, builder: &IndexBuilder) -> Result<Vec<RecordBatch>> {
-        let ctx = SessionContext::new();
-        let df = ctx.read_table(self.provider.clone())?;
-
-        // Apply filter if it exists
-        let df = if let Some(filter) = &builder.filter {
-            df.filter(filter.clone())?
-        } else {
-            df
-        };
-        df.collect().await
     }
 }
 
@@ -615,17 +607,14 @@ async fn build(
     time_column: &str,
     min_max_columns: Vec<String>,
     haw_conf: &HawConf,
+    time_range: Option<(ScalarValue, ScalarValue)>,
 ) -> Result<(
     u64,
     u64,
     ReaderWheel<U32SumAggregator>,
     HashMap<String, ReaderWheel<F64MinMaxAggregator>>,
 )> {
-    let ctx = SessionContext::new();
-    let scan = provider.scan(&ctx.state(), None, &[], None).await?;
-    let task_ctx = Arc::new(TaskContext::default());
-    let stream = scan.execute(0, task_ctx.clone())?;
-    let batches = collect(stream).await?;
+    let batches = prep_index_data(time_column, provider.clone(), &None, &time_range).await?;
     let mut timestamps = Vec::new();
 
     for batch in batches.iter() {
@@ -741,19 +730,29 @@ async fn build_min_max_wheel(
 async fn build_uwheel<A>(
     schema: SchemaRef,
     batches: &[RecordBatch],
-    _min_timestamp_ms: u64,
+    min_timestamp_ms: u64,
     max_timestamp_ms: u64,
     time_col: &str,
-    sum_col: &str,
-    haw_conf: &HawConf,
+    builder: &IndexBuilder,
 ) -> Result<ReaderWheel<A>>
 where
     A: Aggregator<Input = f64>,
 {
-    // TODO: remove hardcoded time
-    let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
-    let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
-    let start_ms = date.timestamp_millis() as u64;
+    let target_col = builder.col.to_string();
+    let haw_conf = builder.conf;
+
+    // Define the start time for the wheel index
+
+    let (start_ms, end_ms) = builder
+        .time_range
+        .as_ref()
+        .map(|(start, end)| {
+            (
+                scalar_to_timestamp(start).unwrap() as u64,
+                scalar_to_timestamp(end).unwrap() as u64,
+            )
+        })
+        .unwrap_or((min_timestamp_ms, max_timestamp_ms));
 
     let conf = haw_conf.with_watermark(start_ms);
 
@@ -763,7 +762,7 @@ where
             .with_write_ahead(64000usize.next_power_of_two()),
     );
 
-    let column_index = schema.index_of(sum_col)?;
+    let column_index = schema.index_of(&target_col)?;
     let column_field = schema.field(column_index);
 
     if is_numeric_type(column_field.data_type()) {
@@ -775,8 +774,8 @@ where
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
 
-            let sum_column_array = batch
-                .column_by_name(sum_col)
+            let column_array = batch
+                .column_by_name(&target_col)
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Float64Array>()
@@ -786,7 +785,7 @@ where
                 .values()
                 .iter()
                 .copied()
-                .zip(sum_column_array.values().iter().copied())
+                .zip(column_array.values().iter().copied())
             {
                 let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
                     .unwrap()
@@ -796,7 +795,7 @@ where
             }
         }
         // Once all data is inserted, advance the wheel to the max timestamp
-        wheel.advance_to(max_timestamp_ms);
+        wheel.advance_to(end_ms);
 
         // convert wheel to index
         wheel.read().to_simd_wheels();
@@ -858,6 +857,37 @@ fn build_count_wheel(
     (count_wheel, min_ms, max_ms)
 }
 
+// internal helper that fetches the record batches
+async fn prep_index_data(
+    time_column: &str,
+    provider: Arc<dyn TableProvider>,
+    filter: &Option<Expr>,
+    time_range: &Option<(ScalarValue, ScalarValue)>,
+) -> Result<Vec<RecordBatch>> {
+    let ctx = SessionContext::new();
+    let df = ctx.read_table(provider)?;
+
+    // Apply filter if it exists
+    let df = if let Some(filter) = filter {
+        df.filter(filter.clone())?
+    } else {
+        df
+    };
+
+    // Apply time-range filter if specified
+    let df = if let Some((start_range, end_range)) = time_range {
+        // WHERE "time_column" >= start_range AND "time_column" < end_range
+        let time_filter = col(time_column)
+            .gt_eq(lit(start_range.clone()))
+            .and(col(time_column).lt(lit(end_range.clone())));
+        df.filter(time_filter)?
+    } else {
+        df
+    };
+
+    df.collect().await
+}
+
 // checks whether the given data type is a numeric type
 fn is_numeric_type(data_type: &DataType) -> bool {
     matches!(
@@ -874,4 +904,18 @@ fn is_numeric_type(data_type: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
     )
+}
+
+fn scalar_to_timestamp(scalar: &ScalarValue) -> Option<i64> {
+    match scalar {
+        ScalarValue::Utf8(Some(date_str)) => DateTime::parse_from_rfc3339(date_str)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc).timestamp_millis()),
+        ScalarValue::TimestampMillisecond(Some(ms), _) => Some(*ms),
+        ScalarValue::TimestampMicrosecond(Some(us), _) => Some(*us / 1000_i64),
+        ScalarValue::TimestampNanosecond(Some(ns), _) => {
+            Some(ns / 1_000_000) // Convert nanoseconds to milliseconds
+        }
+        _ => None,
+    }
 }

@@ -1,5 +1,9 @@
-use crate::UWheelOptimizer;
-use datafusion::{datasource::TableProvider, error::Result};
+use crate::{scalar_to_timestamp, UWheelOptimizer};
+use datafusion::{
+    datasource::TableProvider,
+    error::{DataFusionError, Result},
+    scalar::ScalarValue,
+};
 use std::sync::Arc;
 use uwheel::{wheels::read::aggregation::conf::WheelMode, HawConf};
 
@@ -14,6 +18,8 @@ pub struct Builder {
     min_max_columns: Vec<String>,
     /// Default Haw configuration to use when building wheels
     wheel_conf: HawConf,
+    /// Optional time range to apply to the default indices  
+    time_range: Option<(ScalarValue, ScalarValue)>,
 }
 
 impl Builder {
@@ -24,6 +30,7 @@ impl Builder {
             time_column: time_column.into(),
             min_max_columns: Default::default(),
             wheel_conf: Self::default_haw_conf(),
+            time_range: None,
         }
     }
     // helper method to create a default Haw configuration
@@ -61,6 +68,25 @@ impl Builder {
         self
     }
 
+    /// Applies a time range when building the index
+    ///
+    /// Input must be a ScalarValue of type Date32, Date64 or Timestamp
+    pub fn with_time_range(
+        mut self,
+        start: ScalarValue,
+        end: ScalarValue,
+    ) -> Result<Self, DataFusionError> {
+        match (scalar_to_timestamp(&start), scalar_to_timestamp(&end)) {
+            (Some(_), Some(_)) => {
+                self.time_range = Some((start, end));
+                Ok(self)
+            }
+            _ => Err(DataFusionError::Internal(
+                "Not valid time range data types, must be Date32, Date64, or Timestamp".to_string(),
+            )),
+        }
+    }
+
     /// Columns to build min/max wheels for
     ///
     /// Columns must be of numeric data types
@@ -80,6 +106,7 @@ impl Builder {
             self.min_max_columns,
             provider,
             self.wheel_conf,
+            self.time_range,
         )
         .await
     }
