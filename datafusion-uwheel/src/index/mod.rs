@@ -100,20 +100,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_index_builder() {
+    fn index_builder_simple() {
         let builder = IndexBuilder::with_col_and_aggregate("col", AggregateType::Sum);
         assert_eq!(builder.col.to_string(), "col");
     }
 
     #[test]
-    fn test_index_builder_with_filter() {
+    fn index_builder_with_filter() {
         let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
             .with_filter(col("id").eq(lit(1)));
         assert_eq!(builder.filter.unwrap().to_string(), "id = Int32(1)");
     }
 
     #[test]
-    fn test_index_builder_with_time_range() {
+    fn index_builder_with_time_range() {
         assert!(
             IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
                 .with_time_range(

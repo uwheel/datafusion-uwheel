@@ -11,13 +11,13 @@ readme = "README.md"
 
 [workspace.dependencies]
 uwheel = { version = "0.2.0", default-features = false, features = [
-    "sync",
-    "min_max",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "all",
+  "sync",
+  "min_max",
+  "sum",
+  "avg",
+  "min",
+  "max",
+  "all",
 ] }
 datafusion = "40.0.0"
 chrono = "0.4.38"

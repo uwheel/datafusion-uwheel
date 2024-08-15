@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use datafusion::{
     common::Column,
-    logical_expr::{BinaryExpr, Operator},
+    logical_expr::{Between, BinaryExpr, Operator},
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -60,36 +60,7 @@ fn filter_to_range(start: Option<i64>, end: Option<i64>) -> Option<WheelRange> {
 pub fn extract_uwheel_expr(predicate: &Expr, time_column: &str) -> Option<UWheelExpr> {
     match predicate {
         Expr::BinaryExpr(binary_expr) => handle_binary_expr(binary_expr, time_column),
-        Expr::Between(_between) => unimplemented!(), //handle_between(between, time_column),
-        _ => None,
-    }
-}
-
-/// Attemps to extract a MinMaxPredicate from a Datafusion expr
-pub fn extract_min_max_predicate(predicate: &Expr) -> Option<MinMaxPredicate> {
-    match predicate {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            if let Expr::Column(col) = left.as_ref() {
-                // check if the right side is a literal
-                if let Expr::Cast(cast) = right.as_ref() {
-                    if let Expr::Literal(scalar) = cast.expr.as_ref() {
-                        // check if the operator is a comparison operator
-                        if op == &Operator::Gt
-                            || op == &Operator::GtEq
-                            || op == &Operator::Lt
-                            || op == &Operator::LtEq
-                        {
-                            return Some(MinMaxPredicate {
-                                name: col.name.clone(),
-                                op: *op,
-                                scalar: scalar.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-            None
-        }
+        Expr::Between(between) => handle_between(between, time_column),
         _ => None,
     }
 }
@@ -105,6 +76,70 @@ fn handle_binary_expr(binary_expr: &BinaryExpr, time_column: &str) -> Option<UWh
     match op {
         Operator::And => handle_and_operator(left, right, time_column),
         _ => handle_comparison_operator(left, op, right, time_column),
+    }
+}
+
+// TODO: handle BETWEEN more efficiently, currently rewrites to BinaryExpr
+fn handle_between(between: &Between, time_column: &str) -> Option<UWheelExpr> {
+    let Between {
+        expr,
+        negated,
+        low,
+        high,
+    } = between;
+
+    if *negated {
+        None
+    } else {
+        let lower_bound = BinaryExpr::new(expr.clone(), Operator::GtEq, low.clone());
+        let upper_bound = BinaryExpr::new(expr.clone(), Operator::LtEq, high.clone());
+
+        // Combine the two comparisons with AND
+        let between_expr = BinaryExpr::new(
+            Box::new(Expr::BinaryExpr(lower_bound)),
+            Operator::And,
+            Box::new(Expr::BinaryExpr(upper_bound)),
+        );
+        handle_binary_expr(&between_expr, time_column)
+    }
+}
+
+/// Attemps to extract a MinMaxPredicate from a Datafusion expr
+pub fn extract_min_max_predicate(predicate: &Expr) -> Option<MinMaxPredicate> {
+    let process_scalar = |scalar: &ScalarValue, col: &Column, op: &Operator| {
+        if op == &Operator::Gt
+            || op == &Operator::GtEq
+            || op == &Operator::Lt
+            || op == &Operator::LtEq
+        {
+            Some(MinMaxPredicate {
+                name: col.name.clone(),
+                op: *op,
+                scalar: scalar.clone(),
+            })
+        } else {
+            None
+        }
+    };
+    match predicate {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            if let Expr::Column(col) = left.as_ref() {
+                match right.as_ref() {
+                    Expr::Cast(cast) => {
+                        if let Expr::Literal(scalar) = cast.expr.as_ref() {
+                            process_scalar(scalar, col, op)
+                        } else {
+                            None
+                        }
+                    }
+                    Expr::Literal(scalar) => process_scalar(scalar, col, op),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -181,9 +216,9 @@ fn handle_comparison_operator(
         |col: &Column| {
             if col.name == time_column {
                 match op {
-                    Operator::GtEq | Operator::Gt => extract_timestamp(right)
+                    Operator::GtEq | Operator::Gt => extract_timestamp_ms(right)
                         .map(|ts| UWheelExpr::TemporalFilter(Some(ts), None)),
-                    Operator::Lt | Operator::LtEq => extract_timestamp(right)
+                    Operator::Lt | Operator::LtEq => extract_timestamp_ms(right)
                         .map(|ts| UWheelExpr::TemporalFilter(None, Some(ts))),
                     _ => None,
                 }
@@ -205,7 +240,8 @@ fn handle_comparison_operator(
     }
 }
 
-fn extract_timestamp(expr: &Expr) -> Option<i64> {
+/// Attempts to extract a timestamp from a Datafusion expr that is represented as unix timestamp in milliseconds
+fn extract_timestamp_ms(expr: &Expr) -> Option<i64> {
     match expr {
         Expr::Literal(ScalarValue::Utf8(Some(date_str))) => DateTime::parse_from_rfc3339(date_str)
             .ok()
@@ -215,22 +251,60 @@ fn extract_timestamp(expr: &Expr) -> Option<i64> {
         Expr::Literal(ScalarValue::TimestampNanosecond(Some(ns), _)) => {
             Some(ns / 1_000_000) // Convert nanoseconds to milliseconds
         }
-        Expr::Cast(cast) => extract_timestamp(&cast.expr),
-        // Add other cases as needed, e.g., for different date/time formats
-        _ => panic!("Unsupported expression: {:?}", expr),
+        Expr::Cast(cast) => extract_timestamp_ms(&cast.expr),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use datafusion::prelude::{col, lit};
+    use datafusion::{
+        arrow::datatypes::DataType,
+        logical_expr::Cast,
+        prelude::{col, lit},
+    };
 
     use super::*;
 
     #[test]
-    fn extract_timestamp_test() {
+    fn extract_timestamp_utf8_() {
         let expr = Expr::Literal(ScalarValue::Utf8(Some("2023-01-01T00:00:00Z".to_string())));
-        assert_eq!(extract_timestamp(&expr), Some(1672531200000));
+        assert_eq!(extract_timestamp_ms(&expr), Some(1672531200000));
+    }
+
+    #[test]
+    fn extract_timestamp_millisecond() {
+        let expr = Expr::Literal(ScalarValue::TimestampMillisecond(Some(1672531200000), None));
+        assert_eq!(extract_timestamp_ms(&expr), Some(1672531200000));
+    }
+
+    #[test]
+    fn extract_timestamp_microsecond() {
+        let expr = Expr::Literal(ScalarValue::TimestampMicrosecond(
+            Some(1672531200000000),
+            None,
+        ));
+        assert_eq!(extract_timestamp_ms(&expr), Some(1672531200000));
+    }
+
+    #[test]
+    fn extract_timestamp_nanosecond() {
+        let expr = Expr::Literal(ScalarValue::TimestampNanosecond(
+            Some(1672531200000000000),
+            None,
+        ));
+        assert_eq!(extract_timestamp_ms(&expr), Some(1672531200000));
+    }
+
+    #[test]
+    fn extract_timestamp_cast() {
+        let expr = Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(ScalarValue::Utf8(Some(
+                "2023-01-01T00:00:00Z".to_string(),
+            )))),
+            DataType::Utf8,
+        ));
+        assert_eq!(extract_timestamp_ms(&expr), Some(1672531200000));
     }
 
     fn create_timestamp(date_string: &str) -> i64 {
@@ -241,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_greater_than_or_equal() {
+    fn single_greater_than_or_equal() {
         let expr = col("timestamp").gt_eq(lit("2023-01-01T00:00:00Z"));
         let result = extract_uwheel_expr(&expr, "timestamp");
         assert_eq!(
@@ -254,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_with_and() {
+    fn range_with_and() {
         let expr = col("timestamp")
             .gt_eq(lit("2023-01-01T00:00:00Z"))
             .and(col("timestamp").lt(lit("2023-12-31T23:59:59Z")));
@@ -268,138 +342,101 @@ mod tests {
         );
     }
     #[test]
-    fn test_with_non_matching_column() {
+    fn with_non_matching_column() {
         let expr = col("other_column").gt_eq(lit("2023-01-01T00:00:00Z"));
         let result = extract_uwheel_expr(&expr, "timestamp");
         assert_eq!(result, None);
     }
 
     #[test]
-    fn test_with_non_temporal_expression() {
+    fn with_non_temporal_expression() {
         let expr = col("timestamp").eq(lit(42));
         let result = extract_uwheel_expr(&expr, "timestamp");
         assert_eq!(result, None);
     }
 
-    /*
-     #[test]
-     fn test_range_with_less_than_or_equal() {
-         let expr = col("timestamp")
-             .gt_eq(lit("2023-01-01T00:00:00Z"))
-             .and(col("timestamp").lt_eq(lit("2023-12-31T23:59:59Z")));
-         let result = extract_datetime_range(&expr, "timestamp");
-         assert_eq!(
-             result,
-             Some((
-                 create_timestamp("2023-01-01T00:00:00Z"),
-                 Some(create_timestamp("2023-12-31T23:59:59Z"))
-             ))
-         );
-     }
+    #[test]
+    fn range_with_less_than_or_equal() {
+        let expr = col("timestamp")
+            .gt_eq(lit("2023-01-01T00:00:00Z"))
+            .and(col("timestamp").lt_eq(lit("2023-12-31T23:59:59Z")));
 
-
-
-    */
-
-    /*
-    use datafusion::arrow::datatypes::{Schema, TimeUnit};
-    use datafusion::datasource::TableType;
-    use datafusion::execution::runtime_env::RuntimeEnv;
-    use datafusion::logical_expr::{LogicalPlanBuilder, TableSource};
-    use datafusion::prelude::{col, lit, Expr};
-    use std::any::Any;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_uwheel_planner() -> Result<()> {
-        // Create a mock schema
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "tpep_dropoff_datetime",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
-            Field::new("fare_amount", DataType::Float64, false),
-        ]));
-
-        let provider = Arc::new(MockTableProvider::new(schema));
-        // Create a mock logical plan
-        let logical_plan = LogicalPlanBuilder::scan("yellow_tripdata", provider.clone(), None)?
-            .filter(col("tpep_dropoff_datetime").gt_eq(lit("2023-01-01T00:00:00Z")))?
-            .filter(col("tpep_dropoff_datetime").lt(lit("2023-01-02T00:00:00Z")))?
-            .build()?;
-
-        // Create a mock session state
-        let session_state =
-            SessionState::new_with_config_rt(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
-
-        let optimizer = Arc::new(
-            crate::builder::Builder::new("tpep_dropoff_datetime")
-                .with_name("yellow_tripdata")
-                .build_with_provider(provider)
-                .await?,
+        let result = extract_uwheel_expr(&expr, "timestamp");
+        assert_eq!(
+            result,
+            Some(UWheelExpr::WheelRange(WheelRange::new_unchecked(
+                create_timestamp("2023-01-01T00:00:00Z") as u64,
+                create_timestamp("2023-12-31T23:59:59Z") as u64
+            ))),
         );
-
-        Ok(())
     }
 
-    // Mock TableProvider for testing
-    struct MockTableProvider {
-        schema: Arc<Schema>,
+    #[test]
+    fn between() {
+        let expr =
+            col("timestamp").between(lit("2023-01-01T00:00:00Z"), lit("2023-12-31T23:59:59Z"));
+        let result = extract_uwheel_expr(&expr, "timestamp");
+        assert_eq!(
+            result,
+            Some(UWheelExpr::WheelRange(WheelRange::new_unchecked(
+                create_timestamp("2023-01-01T00:00:00Z") as u64,
+                create_timestamp("2023-12-31T23:59:59Z") as u64
+            ))),
+        );
     }
 
-    impl MockTableProvider {
-        fn new(schema: Arc<Schema>) -> Self {
-            Self { schema }
-        }
+    #[test]
+    fn min_max_filter() {
+        let expr = col("timestamp")
+            .gt_eq(lit("2023-01-01T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2023-12-31T23:59:59Z")))
+            .and(col("value").gt(lit(1000)));
+        let result = extract_uwheel_expr(&expr, "timestamp");
+        assert_eq!(
+            result,
+            Some(UWheelExpr::MinMaxFilter(MinMaxFilter {
+                range: WheelRange::new_unchecked(
+                    create_timestamp("2023-01-01T00:00:00Z") as u64,
+                    create_timestamp("2023-12-31T23:59:59Z") as u64
+                ),
+                predicate: MinMaxPredicate {
+                    name: "value".to_string(),
+                    op: Operator::Gt,
+                    scalar: ScalarValue::Int32(Some(1000))
+                }
+            }))
+        );
     }
 
-    impl TableSource for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn schema(&self) -> Arc<Schema> {
-            self.schema.clone()
-        }
-
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
+    #[test]
+    fn min_max_filter_with_non_matching_column() {
+        let expr = col("timestamp")
+            .gt_eq(lit("2023-01-01T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2023-12-31T23:59:59Z")))
+            .and(col("other_column").gt(lit(1000)));
+        let result = extract_uwheel_expr(&expr, "other_timestamp");
+        assert_eq!(result, None);
     }
 
-    #[async_trait::async_trait]
-    impl TableProvider for MockTableProvider {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-        fn schema(&self) -> Arc<Schema> {
-            self.schema.clone()
-        }
-        async fn scan(
-            &self,
-            _state: &SessionState,
-            _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            unimplemented!();
-            /*
-            Ok(Arc::new(MemoryExec::try_new(&vec![RecordBatch::try_new(
-                self.schema.clone(),
-                vec![
-                    Arc::new(TimestampArray::from_vec(
-                        vec![Some(1672531200000), Some(1672617600000)],
-                        None,
-                    )),
-                    Arc::new(Float64Array::from_vec(vec![42.0, 43.0])),
-                ],
-            )?])?))
-            */
-        }
+    #[test]
+    fn min_max_filter_with_between() {
+        let expr = col("timestamp")
+            .between(lit("2023-01-01T00:00:00Z"), lit("2023-12-31T23:59:59Z"))
+            .and(col("value").gt(lit(1000)));
+        let result = extract_uwheel_expr(&expr, "timestamp");
+        assert_eq!(
+            result,
+            Some(UWheelExpr::MinMaxFilter(MinMaxFilter {
+                range: WheelRange::new_unchecked(
+                    create_timestamp("2023-01-01T00:00:00Z") as u64,
+                    create_timestamp("2023-12-31T23:59:59Z") as u64
+                ),
+                predicate: MinMaxPredicate {
+                    name: "value".to_string(),
+                    op: Operator::Gt,
+                    scalar: ScalarValue::Int32(Some(1000))
+                }
+            }))
+        );
     }
-    */
 }
