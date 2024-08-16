@@ -3,11 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use datafusion::error::Result;
+use chrono::{DateTime, Utc};
 use datafusion::{
     arrow::{
-        array::{ArrayRef, Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray},
+        array::{Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray},
         datatypes::{DataType, SchemaRef},
     },
     common::{tree_node::Transformed, DFSchema, DFSchemaRef},
@@ -21,6 +20,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion::{error::Result, logical_expr::expr::AggregateFunction};
 use expr::{
     extract_filter_expr, extract_uwheel_expr, extract_wheel_range, MinMaxFilter, UWheelExpr,
 };
@@ -341,11 +341,11 @@ impl UWheelOptimizer {
                     match agg_expr {
                         // COUNT(*)
                         Expr::Alias(alias) if alias.name == COUNT_STAR_ALIAS => {
-                            // extract possible time range filter
-                            let range = extract_wheel_range(&filter.predicate, &self.time_column)?;
-                            let count = self.count(range)?; // early return if range is not queryable
-                            let schema = Arc::new(plan.schema().clone().as_arrow().clone());
-                            count_scan(count, schema).ok()
+                            self.try_count_rewrite(filter, plan)
+                        }
+                        // Also check
+                        Expr::AggregateFunction(agg) if is_count_star_aggregate(agg) => {
+                            self.try_count_rewrite(filter, plan)
                         }
                         // Single Aggregate Function (e.g., SUM(col))
                         Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
@@ -396,6 +396,13 @@ impl UWheelOptimizer {
             Some(UWheelExpr::MinMaxFilter(min_max)) => self.maybe_min_max_filter(min_max, plan),
             _ => None,
         }
+    }
+
+    fn try_count_rewrite(&self, filter: &Filter, plan: &LogicalPlan) -> Option<LogicalPlan> {
+        let range = extract_wheel_range(&filter.predicate, &self.time_column)?;
+        let count = self.count(range)?; // early return if range is not queryable
+        let schema = Arc::new(plan.schema().clone().as_arrow().clone());
+        count_scan(count, schema).ok()
     }
 
     // Queries the range using the count wheel, returning a empty table scan if the count is 0
@@ -481,9 +488,8 @@ impl UWheelOptimizer {
 }
 
 fn count_scan(count: u32, schema: SchemaRef) -> Result<LogicalPlan> {
-    let name = COUNT_STAR_ALIAS.to_string();
     let data = Int64Array::from(vec![count as i64]);
-    let record_batch = RecordBatch::try_from_iter(vec![(&name, Arc::new(data) as ArrayRef)])?;
+    let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)])?;
     let df_schema = Arc::new(DFSchema::try_from(schema.clone())?);
     let mem_table = MemTable::try_new(schema, vec![vec![record_batch]])?;
 
@@ -551,6 +557,7 @@ fn func_def_to_aggregate_type(func_def: &AggregateFunctionDefinition) -> Option<
         AggregateFunctionDefinition::BuiltIn(datafusion::logical_expr::AggregateFunction::Min) => {
             Some(AggregateType::Min)
         }
+        AggregateFunctionDefinition::UDF(udf) if udf.name() == "avg" => Some(AggregateType::Avg),
         AggregateFunctionDefinition::UDF(udf) if udf.name() == "sum" => Some(AggregateType::Sum),
         AggregateFunctionDefinition::UDF(udf) if udf.name() == "count" => {
             Some(AggregateType::Count)
@@ -597,6 +604,30 @@ fn mem_table_as_table_scan(table: MemTable, original_schema: DFSchemaRef) -> Res
     // for the TableScan which may be empty in the original plan.
     table_scan.projected_schema = original_schema;
     Ok(LogicalPlan::TableScan(table_scan))
+}
+
+fn is_wildcard(expr: &Expr) -> bool {
+    matches!(expr, Expr::Wildcard { qualifier: None })
+}
+
+/// Determines if the given aggregate function is a COUNT(*) aggregate.
+///
+/// An aggregate function is a COUNT(*) aggregate if its function name is "COUNT" and it either has a single argument that is a wildcard (`*`), or it has no arguments.
+///
+/// # Arguments
+///
+/// * `aggregate_function` - The aggregate function to check.
+///
+/// # Returns
+///
+/// `true` if the aggregate function is a COUNT(*) aggregate, `false` otherwise.
+fn is_count_star_aggregate(aggregate_function: &AggregateFunction) -> bool {
+    matches!(aggregate_function,
+        AggregateFunction {
+            func_def,
+            args,
+            ..
+        } if func_def.name() == "COUNT" && (args.len() == 1 && is_wildcard(&args[0]) || args.is_empty()))
 }
 
 // Helper methods to build the UWheelOptimizer
@@ -666,18 +697,13 @@ async fn build(
 async fn build_min_max_wheel(
     schema: SchemaRef,
     batches: &[RecordBatch],
-    _min_timestamp_ms: u64,
+    min_timestamp_ms: u64,
     max_timestamp_ms: u64,
     time_col: &str,
     min_max_col: &str,
     haw_conf: &HawConf,
 ) -> Result<ReaderWheel<F64MinMaxAggregator>> {
-    // TODO: remove hardcoded time
-    let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
-    let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
-    let start_ms = date.timestamp_millis() as u64;
-
-    let conf = haw_conf.with_watermark(start_ms);
+    let conf = haw_conf.with_watermark(min_timestamp_ms);
 
     let mut wheel: RwWheel<F64MinMaxAggregator> = RwWheel::with_conf(
         Conf::default()
@@ -794,13 +820,15 @@ where
                 wheel.insert(entry);
             }
         }
-        // Once all data is inserted, advance the wheel to the max timestamp
-        wheel.advance_to(end_ms);
+        // Once all data is inserted, advance the wheel to the max timestamp + 1 second
+        wheel.advance_to(end_ms + 1000);
 
         // convert wheel to index
         wheel.read().to_simd_wheels();
         // TODO: make this configurable
-        wheel.read().to_prefix_wheels();
+        if A::invertible() {
+            wheel.read().to_prefix_wheels();
+        }
     } else {
         // TODO: return Datafusion Error?
         panic!("Min/Max column must be a numeric type");
@@ -827,11 +855,7 @@ fn build_count_wheel(
         .unwrap()
         .timestamp_millis() as u64;
 
-    let start = NaiveDate::from_ymd_opt(2022, 1, 1).unwrap();
-    let date = Utc.from_utc_datetime(&start.and_hms_opt(0, 0, 0).unwrap());
-    let start_ms = date.timestamp_millis() as u64;
-
-    let conf = haw_conf.with_watermark(start_ms);
+    let conf = haw_conf.with_watermark(min_ms);
 
     let mut count_wheel: RwWheel<U32SumAggregator> = RwWheel::with_conf(
         Conf::default()
@@ -843,12 +867,13 @@ fn build_count_wheel(
         let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
             .unwrap()
             .timestamp_millis() as u64;
+
         // Record a count
         let entry = Entry::new(1, timestamp_ms);
         count_wheel.insert(entry);
     }
 
-    count_wheel.advance_to(max_ms);
+    count_wheel.advance_to(max_ms + 1000); // + 1 second
 
     // convert wheel to index
     count_wheel.read().to_simd_wheels();
@@ -917,5 +942,464 @@ fn scalar_to_timestamp(scalar: &ScalarValue) -> Option<i64> {
             Some(ns / 1_000_000) // Convert nanoseconds to milliseconds
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use chrono::TimeZone;
+    use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
+    use datafusion::functions_aggregate::expr_fn::avg;
+    use datafusion::logical_expr::test::function_stub::{count, sum};
+
+    use super::*;
+    use builder::Builder;
+
+    fn create_test_memtable() -> Result<MemTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("agg_col", DataType::Float64, false),
+        ]));
+
+        // Define the start time as 2024-05-10 00:00:00 UTC
+        let base_time: DateTime<Utc> = Utc.with_ymd_and_hms(2024, 5, 10, 0, 0, 0).unwrap();
+        let timestamps: Vec<i64> = (0..10)
+            .map(|i| base_time + Duration::seconds(i))
+            .map(|dt| dt.timestamp_micros())
+            .collect();
+
+        let agg_values: Vec<f64> = (0..10).map(|i| (i + 1) as f64).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(Float64Array::from(agg_values)),
+            ],
+        )?;
+
+        MemTable::try_new(schema, vec![vec![batch]])
+    }
+
+    #[tokio::test]
+    async fn create_optimizer_with_memtable() {
+        let provider = Arc::new(create_test_memtable().unwrap());
+        assert!(Builder::new("timestamp")
+            .with_name("test")
+            .build_with_provider(provider)
+            .await
+            .is_ok());
+    }
+
+    async fn test_optimizer() -> Result<Arc<UWheelOptimizer>> {
+        let provider = Arc::new(create_test_memtable()?);
+        Ok(Arc::new(
+            Builder::new("timestamp")
+                .with_name("test")
+                .build_with_provider(provider)
+                .await?,
+        ))
+    }
+
+    #[tokio::test]
+    async fn count_star_aggregation_rewrite() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![count(wildcard())])?
+                .project(vec![count(wildcard())])?
+                .build()?;
+
+        // Assert that the original plan is a Projection
+        assert!(matches!(plan, LogicalPlan::Projection(_)));
+
+        let rewritten = optimizer.try_rewrite(&plan).unwrap();
+        // assert it was rewritten to a TableScan
+        assert!(matches!(rewritten, LogicalPlan::TableScan(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sum_aggregation_rewrite() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+
+        // Build a sum index
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Sum,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![sum(col("agg_col"))])?
+                .project(vec![sum(col("agg_col"))])?
+                .build()?;
+
+        // Assert that the original plan is a Projection
+        assert!(matches!(plan, LogicalPlan::Projection(_)));
+
+        let rewritten = optimizer.try_rewrite(&plan).unwrap();
+        // assert it was rewritten to a TableScan
+        assert!(matches!(rewritten, LogicalPlan::TableScan(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn min_aggregation_rewrite() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+
+        // Build a min index
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Min,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![min(col("agg_col"))])?
+                .project(vec![min(col("agg_col"))])?
+                .build()?;
+
+        // Assert that the original plan is a Projection
+        assert!(matches!(plan, LogicalPlan::Projection(_)));
+
+        let rewritten = optimizer.try_rewrite(&plan).unwrap();
+        // assert it was rewritten to a TableScan
+        assert!(matches!(rewritten, LogicalPlan::TableScan(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn max_aggregation_rewrite() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Max,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![max(col("agg_col"))])?
+                .project(vec![max(col("agg_col"))])?
+                .build()?;
+
+        // Assert that the original plan is a Projection
+        assert!(matches!(plan, LogicalPlan::Projection(_)));
+
+        let rewritten = optimizer.try_rewrite(&plan).unwrap();
+        // assert it was rewritten to a TableScan
+        assert!(matches!(rewritten, LogicalPlan::TableScan(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn avg_aggregation_rewrite() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Avg,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![avg(col("agg_col"))])?
+                .project(vec![avg(col("agg_col"))])?
+                .build()?;
+
+        // Assert that the original plan is a Projection
+        assert!(matches!(plan, LogicalPlan::Projection(_)));
+
+        let rewritten = optimizer.try_rewrite(&plan).unwrap();
+        // assert it was rewritten to a TableScan
+        assert!(matches!(rewritten, LogicalPlan::TableScan(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_star_aggregation_invalid_rewrite() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+        // invalid temporal filter
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-11T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-11T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![count(wildcard())])?
+                .project(vec![count(wildcard())])?
+                .build()?;
+
+        assert!(optimizer.try_rewrite(&plan).is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn count_star_aggregation_exec() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![count(wildcard())])?
+                .project(vec![count(wildcard())])?
+                .build()?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", optimizer.provider().clone())?;
+
+        // Set UWheelOptimizer as optimizer rule
+        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let uwheel_ctx = SessionContext::new_with_state(session_state);
+
+        // Run the query through the ctx that has our OptimizerRule
+        let df = uwheel_ctx.execute_logical_plan(plan).await?;
+        let results = df.collect().await?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            10,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sum_aggregation_exec() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Sum,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![sum(col("agg_col"))])?
+                .project(vec![sum(col("agg_col"))])?
+                .build()?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", optimizer.provider().clone())?;
+
+        // Set UWheelOptimizer as optimizer rule
+        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let uwheel_ctx = SessionContext::new_with_state(session_state);
+
+        // Run the query through the ctx that has our OptimizerRule
+        let df = uwheel_ctx.execute_logical_plan(plan).await?;
+        let results = df.collect().await?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            55.0 //  1 + 2 +3 + ... + 9 + 10 = 55
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn min_aggregation_exec() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Min,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![min(col("agg_col"))])?
+                .project(vec![min(col("agg_col"))])?
+                .build()?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", optimizer.provider().clone())?;
+
+        // Set UWheelOptimizer as optimizer rule
+        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let uwheel_ctx = SessionContext::new_with_state(session_state);
+
+        // Run the query through the ctx that has our OptimizerRule
+        let df = uwheel_ctx.execute_logical_plan(plan).await?;
+        let results = df.collect().await?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            1.0
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn max_aggregation_exec() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Max,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![max(col("agg_col"))])?
+                .project(vec![max(col("agg_col"))])?
+                .build()?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", optimizer.provider().clone())?;
+
+        // Set UWheelOptimizer as optimizer rule
+        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let uwheel_ctx = SessionContext::new_with_state(session_state);
+
+        // Run the query through the ctx that has our OptimizerRule
+        let df = uwheel_ctx.execute_logical_plan(plan).await?;
+        let results = df.collect().await?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            10.0
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn avg_aggregation_exec() -> Result<()> {
+        let optimizer = test_optimizer().await?;
+        optimizer
+            .build_index(IndexBuilder::with_col_and_aggregate(
+                "agg_col",
+                AggregateType::Avg,
+            ))
+            .await?;
+
+        let temporal_filter = col("timestamp")
+            .gt_eq(lit("2024-05-10T00:00:00Z"))
+            .and(col("timestamp").lt(lit("2024-05-10T00:00:10Z")));
+
+        let plan =
+            LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
+                .filter(temporal_filter)?
+                .aggregate(Vec::<Expr>::new(), vec![avg(col("agg_col"))])?
+                .project(vec![avg(col("agg_col"))])?
+                .build()?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("test", optimizer.provider().clone())?;
+
+        // Set UWheelOptimizer as optimizer rule
+        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let uwheel_ctx = SessionContext::new_with_state(session_state);
+
+        // Run the query through the ctx that has our OptimizerRule
+        let df = uwheel_ctx.execute_logical_plan(plan).await?;
+        let results = df.collect().await?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            5.5,
+        );
+
+        Ok(())
     }
 }
