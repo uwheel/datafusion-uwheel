@@ -8,11 +8,16 @@ use std::{
 use chrono::{DateTime, Utc};
 use datafusion::{
     arrow::{
-        array::{Float64Array, Int64Array, RecordBatch, TimestampMicrosecondArray},
-        datatypes::{DataType, SchemaRef},
+        array::{
+            Array, Date32Array, Date64Array, Float64Array, Int64Array, RecordBatch,
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+            TimestampSecondArray,
+        },
+        datatypes::{DataType, SchemaRef, TimeUnit},
     },
     common::{tree_node::Transformed, DFSchema, DFSchemaRef},
     datasource::{provider_as_source, MemTable, TableProvider},
+    error::DataFusionError,
     logical_expr::{
         expr::AggregateFunctionDefinition, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
         Projection, TableScan,
@@ -658,14 +663,8 @@ async fn build(
             "Specified Time column does not exist in the provided data"
         );
 
-        let time_array = batch
-            .column_by_name(time_column)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-
-        let batch_timestamps: Vec<_> = time_array.values().iter().copied().collect();
+        let time_array = batch.column_by_name(time_column).unwrap();
+        let batch_timestamps = extract_timestamps_from_array(time_array)?;
         timestamps.extend_from_slice(&batch_timestamps);
     }
 
@@ -718,12 +717,9 @@ async fn build_min_max_wheel(
 
     if is_numeric_type(column_field.data_type()) {
         for batch in batches {
-            let time_array = batch
-                .column_by_name(time_col)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
+            let time_array = batch.column_by_name(time_col).unwrap();
+
+            let time_values = extract_timestamps_from_array(time_array)?;
 
             let min_max_column_array = batch
                 .column_by_name(min_max_col)
@@ -732,16 +728,12 @@ async fn build_min_max_wheel(
                 .downcast_ref::<Float64Array>()
                 .unwrap();
 
-            for (timestamp, value) in time_array
-                .values()
+            for (timestamp, value) in time_values
                 .iter()
                 .copied()
                 .zip(min_max_column_array.values().iter().copied())
             {
-                let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
-                    .unwrap()
-                    .timestamp_millis() as u64;
-                let entry = Entry::new(value, timestamp_ms);
+                let entry = Entry::new(value, timestamp);
                 wheel.insert(entry);
             }
         }
@@ -795,12 +787,9 @@ where
 
     if is_numeric_type(column_field.data_type()) {
         for batch in batches {
-            let time_array = batch
-                .column_by_name(time_col)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
+            let time_array = batch.column_by_name(time_col).unwrap();
+
+            let time_values = extract_timestamps_from_array(time_array)?;
 
             let column_array = batch
                 .column_by_name(&target_col)
@@ -809,16 +798,12 @@ where
                 .downcast_ref::<Float64Array>()
                 .unwrap();
 
-            for (timestamp, value) in time_array
-                .values()
+            for (timestamp, value) in time_values
                 .iter()
                 .copied()
                 .zip(column_array.values().iter().copied())
             {
-                let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
-                    .unwrap()
-                    .timestamp_millis() as u64;
-                let entry = Entry::new(value, timestamp_ms);
+                let entry = Entry::new(value, timestamp);
                 wheel.insert(entry);
             }
         }
@@ -843,19 +828,11 @@ where
 ///
 /// Uses a U32SumAggregator internally with prefix-sum optimization
 fn build_count_wheel(
-    timestamps: Vec<i64>,
+    timestamps: Vec<u64>,
     haw_conf: &HawConf,
 ) -> (RwWheel<U32SumAggregator>, u64, u64) {
-    let min = timestamps.iter().min().copied().unwrap();
-    let max = timestamps.iter().max().copied().unwrap();
-
-    let min_ms = DateTime::from_timestamp_micros(min)
-        .unwrap()
-        .timestamp_millis() as u64;
-
-    let max_ms = DateTime::from_timestamp_micros(max)
-        .unwrap()
-        .timestamp_millis() as u64;
+    let min_ms = timestamps.iter().min().copied().unwrap();
+    let max_ms = timestamps.iter().max().copied().unwrap();
 
     let conf = haw_conf.with_watermark(min_ms);
 
@@ -866,12 +843,8 @@ fn build_count_wheel(
     );
 
     for timestamp in timestamps {
-        let timestamp_ms = DateTime::from_timestamp_micros(timestamp)
-            .unwrap()
-            .timestamp_millis() as u64;
-
         // Record a count
-        let entry = Entry::new(1, timestamp_ms);
+        let entry = Entry::new(1, timestamp);
         count_wheel.insert(entry);
     }
 
@@ -944,6 +917,86 @@ fn scalar_to_timestamp(scalar: &ScalarValue) -> Option<i64> {
             Some(ns / 1_000_000) // Convert nanoseconds to milliseconds
         }
         _ => None,
+    }
+}
+
+/// Extracts timestamps from a given array of timestamp data.
+/// The function supports various timestamp data types, including:
+/// - Timestamp (Nanosecond, Microsecond, Millisecond, Second)
+/// - Time64 (Nanosecond, Microsecond)
+/// - Time32 (Millisecond, Second)
+/// - Date32
+/// - Date64
+///
+/// The function returns a `Vec<u64>` containing the extracted timestamps in milliseconds.
+fn extract_timestamps_from_array(time_array: &Arc<dyn Array>) -> Result<Vec<u64>> {
+    let data_type = time_array.data_type();
+    match data_type {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) | DataType::Time64(TimeUnit::Nanosecond) => {
+            Ok(time_array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .map(|ts| (ts / 1_000_000) as u64)
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) | DataType::Time64(TimeUnit::Microsecond) => {
+            Ok(time_array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .map(|ts| (ts / 1_000) as u64)
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) | DataType::Time32(TimeUnit::Millisecond) => {
+            Ok(time_array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .map(|ts| ts as u64)
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Second, _) | DataType::Time32(TimeUnit::Second) => {
+            Ok(time_array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .map(|ts| (ts * 1_000) as u64)
+                .collect())
+        }
+        DataType::Date32 => Ok(time_array
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .map(|ts| ts as u64)
+            .collect()),
+        DataType::Date64 => Ok(time_array
+            .as_any()
+            .downcast_ref::<Date64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .copied()
+            .map(|ts| ts as u64)
+            .collect()),
+        _ => Err(DataFusionError::Internal(
+            "Unsupported timestamp data type, this function supports: DataType::Timestamp(), DataType::Time32/64, DataType::Date32/64 ".to_string(),
+        )),
     }
 }
 
