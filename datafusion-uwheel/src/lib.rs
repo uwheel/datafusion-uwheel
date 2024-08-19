@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},

@@ -1,3 +1,7 @@
+![ci](https://github.com/uwheel/datafusion-uwheel/actions/workflows/rust.yml/badge.svg)
+[![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
+[![Apache](https://img.shields.io/badge/license-Apache-blue.svg)](https://github.com/uwheel/datafusion-uwheel/blob/main/LICENSE.txt)
+
 # datafusion-uwheel
 
 ``datafusion-uwheel`` is a Datafusion query optimizer that indexes data using [µWheel](https://uwheel.rs) to accelerate query processing. The motivation behind this work is based on the following [post](https://uwheel.rs/post/datafusion/).

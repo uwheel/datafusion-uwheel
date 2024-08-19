@@ -1,0 +1,35 @@
+on: [push, pull_request]
+
+name: Rust
+
+env:
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  fmt-clippy-check-test:
+    name: Format + Clippy + check + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Set up cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo hack
+        run: cargo install cargo-hack
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo hack clippy --workspace --all-targets --  -D warnings -W clippy::all
+
+      - name: Check
+        run: cargo hack check --all
+
+      - name: Test
+        run: cargo hack test --workspace
