@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["benchmarks/nyc_taxi_bench", "datafusion-uwheel"]
+members = ["benchmarks/nyc_taxi_bench", "datafusion-uwheel", "examples/*"]
 
 [workspace.package]
 version = "40.0.0"
@@ -19,7 +19,9 @@ uwheel = { version = "0.2.0", default-features = false, features = [
   "max",
   "all",
 ] }
+datafusion-uwheel = { path = "datafusion-uwheel", version = "40.0.0" }
 datafusion = "40.0.0"
 chrono = "0.4.38"
 bitpacking = "0.9.2"
 tokio = "1.38.1"
+human_bytes = "0.4.3"

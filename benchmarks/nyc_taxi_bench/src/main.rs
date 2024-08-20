@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
         .build_index(
             IndexBuilder::with_col_and_aggregate(
                 "fare_amount",
-                datafusion_uwheel::AggregateType::Sum,
+                datafusion_uwheel::UWheelAggregate::Sum,
             )
             .with_time_range(
                 ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
         .build_index(
             IndexBuilder::with_col_and_aggregate(
                 "fare_amount",
-                datafusion_uwheel::AggregateType::Sum,
+                datafusion_uwheel::UWheelAggregate::Sum,
             )
             .with_filter(col("passenger_count").eq(lit(3.0)))
             .with_time_range(

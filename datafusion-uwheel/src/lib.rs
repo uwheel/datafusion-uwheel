@@ -1,3 +1,8 @@
+//! datafusion-uwheel is a DataFusion query optimizer that indexes data using [µWheel](https://github.com/uwheel/uwheel) to accelerate temporal query processing.
+//!
+//! Learn more about the project [here](https://github.com/uwheel/datafusion-wheel).
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![deny(nonstandard_style, missing_copy_implementations, missing_docs)]
 #![forbid(unsafe_code)]
 
 use std::{
@@ -5,7 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use datafusion::{
     arrow::{
         array::{
@@ -19,8 +24,8 @@ use datafusion::{
     datasource::{provider_as_source, MemTable, TableProvider},
     error::DataFusionError,
     logical_expr::{
-        expr::AggregateFunctionDefinition, Filter, LogicalPlan, LogicalPlanBuilder, Operator,
-        Projection, TableScan,
+        expr::AggregateFunctionDefinition, Aggregate, Filter, LogicalPlan, LogicalPlanBuilder,
+        Operator, Projection, TableScan,
     },
     optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
     prelude::*,
@@ -51,17 +56,18 @@ pub mod builder;
 /// Various expressions that the optimizer supports
 mod expr;
 
-mod index;
+/// Module containing util for creating wheel indices
+pub mod index;
 
-pub use index::{AggregateType, IndexBuilder};
+pub use index::{IndexBuilder, UWheelAggregate};
 
-pub const COUNT_STAR_ALIAS: &str = "count(*)";
-pub const STAR_AGGREGATION_ALIAS: &str = "*_AGG";
+const COUNT_STAR_ALIAS: &str = "count(*)";
+const STAR_AGGREGATION_ALIAS: &str = "*_AGG";
 
-pub type WheelMap<A> = Arc<Mutex<HashMap<String, ReaderWheel<A>>>>;
+type WheelMap<A> = Arc<Mutex<HashMap<String, ReaderWheel<A>>>>;
 
 #[derive(Clone)]
-pub struct BuiltInWheels {
+struct BuiltInWheels {
     /// A COUNT(*) wheel over the underlying table data and time column
     pub count: ReaderWheel<U32SumAggregator>,
     /// Min/Max pruning wheels for a specific column
@@ -144,7 +150,8 @@ impl BuiltInWheels {
 }
 
 /// A µWheel optimizer for DataFusion that indexes wheels for time-based analytical queries.
-#[allow(dead_code)]
+///
+/// See [builder::Builder] for how to build an optimizer instance
 pub struct UWheelOptimizer {
     /// Name of the table
     name: String,
@@ -154,8 +161,6 @@ pub struct UWheelOptimizer {
     wheels: BuiltInWheels,
     /// Table provider which UWheelOptimizer builds indexes on top of
     provider: Arc<dyn TableProvider>,
-    /// Default Wheel configuration that is used to build indexes
-    haw_conf: HawConf,
     /// The minimum timestamp in milliseconds for the underlying data using `time_column`
     min_timestamp_ms: u64,
     /// The maximum timestamp in milliseconds for the underlying data using `time_column`
@@ -191,7 +196,6 @@ impl UWheelOptimizer {
             time_column,
             wheels,
             provider,
-            haw_conf,
             min_timestamp_ms,
             max_timestamp_ms,
         })
@@ -249,7 +253,7 @@ impl UWheelOptimizer {
         let expr_key = format!("{}.{}.{}", self.name, col, expr_key);
 
         match builder.agg_type {
-            AggregateType::Sum => {
+            UWheelAggregate::Sum => {
                 let wheel = build_uwheel::<F64SumAggregator>(
                     schema,
                     &batches,
@@ -261,7 +265,7 @@ impl UWheelOptimizer {
                 .await?;
                 self.wheels.sum.lock().unwrap().insert(expr_key, wheel);
             }
-            AggregateType::Avg => {
+            UWheelAggregate::Avg => {
                 let wheel = build_uwheel::<F64AvgAggregator>(
                     schema,
                     &batches,
@@ -273,7 +277,7 @@ impl UWheelOptimizer {
                 .await?;
                 self.wheels.avg.lock().unwrap().insert(expr_key, wheel);
             }
-            AggregateType::Min => {
+            UWheelAggregate::Min => {
                 let wheel = build_uwheel::<F64MinAggregator>(
                     schema,
                     &batches,
@@ -285,7 +289,7 @@ impl UWheelOptimizer {
                 .await?;
                 self.wheels.min.lock().unwrap().insert(expr_key, wheel);
             }
-            AggregateType::Max => {
+            UWheelAggregate::Max => {
                 let wheel = build_uwheel::<F64MaxAggregator>(
                     schema,
                     &batches,
@@ -297,7 +301,7 @@ impl UWheelOptimizer {
                 .await?;
                 self.wheels.max.lock().unwrap().insert(expr_key, wheel);
             }
-            AggregateType::All => {
+            UWheelAggregate::All => {
                 let wheel = build_uwheel::<AllAggregator>(
                     schema,
                     &batches,
@@ -319,12 +323,27 @@ impl UWheelOptimizer {
     /// This function takes a logical plan and checks whether it can be rewritten using `uwheel`
     ///
     /// Returns `Some(LogicalPlan)` with the rewritten plan, otherwise None.
-    pub fn try_rewrite(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+    pub(crate) fn try_rewrite(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
         match plan {
             LogicalPlan::Filter(filter) => self.try_rewrite_filter(filter, plan),
             LogicalPlan::Projection(projection) => self.try_rewrite_projection(projection, plan),
             _ => None, // cannot rewrite
         }
+    }
+
+    /// This function is used to determine if the Aggregate has a filter applied to its input.
+    fn has_filter(agg: &Aggregate) -> bool {
+        matches!(agg.input.as_ref(), LogicalPlan::Filter(_))
+    }
+
+    // Returns true if the aggregate contains an input Filter and has only one aggr expr
+    fn single_aggregate_with_filter(agg: &Aggregate) -> bool {
+        Self::has_filter(agg) && Self::single_agg(agg)
+    }
+
+    /// Checks whether the Aggregate has no group_expr and aggr_expr has a length of 1
+    fn single_agg(agg: &Aggregate) -> bool {
+        agg.group_expr.is_empty() && agg.aggr_expr.len() == 1
     }
 
     // Attemps to rewrite a top-level Projection plan
@@ -334,54 +353,46 @@ impl UWheelOptimizer {
         plan: &LogicalPlan,
     ) -> Option<LogicalPlan> {
         match projection.input.as_ref() {
-            LogicalPlan::Aggregate(agg) => {
-                // SELECT AGG FROM X WHERE TIME >= X AND TIME <= Y
-
+            // SELECT AGG FROM X WHERE TIME >= X AND TIME <= Y
+            LogicalPlan::Aggregate(agg) if Self::single_aggregate_with_filter(agg) => {
                 // Only continue if the aggregation has a filter
                 let LogicalPlan::Filter(filter) = agg.input.as_ref() else {
                     return None;
                 };
 
-                // Check no GROUP BY and only one aggregation (for now)
-                if agg.group_expr.is_empty() && agg.aggr_expr.len() == 1 {
-                    let agg_expr = agg.aggr_expr.first().unwrap();
-                    match agg_expr {
-                        // COUNT(*)
-                        Expr::Alias(alias) if alias.name == COUNT_STAR_ALIAS => {
-                            self.try_count_rewrite(filter, plan)
-                        }
-                        // Also check
-                        Expr::AggregateFunction(agg) if is_count_star_aggregate(agg) => {
-                            self.try_count_rewrite(filter, plan)
-                        }
-                        // Single Aggregate Function (e.g., SUM(col))
-                        Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
-                            if let Expr::Column(col) = &agg.args[0] {
-                                // Fetch temporal filter range and expr key which is used to identify a wheel
-                                let (range, expr_key) = match extract_filter_expr(
-                                    &filter.predicate,
-                                    &self.time_column,
-                                )? {
+                let agg_expr = agg.aggr_expr.first().unwrap();
+                match agg_expr {
+                    // COUNT(*)
+                    Expr::Alias(alias) if alias.name == COUNT_STAR_ALIAS => {
+                        self.try_count_rewrite(filter, plan)
+                    }
+                    // Also check
+                    Expr::AggregateFunction(agg) if is_count_star_aggregate(agg) => {
+                        self.try_count_rewrite(filter, plan)
+                    }
+                    // Single Aggregate Function (e.g., SUM(col))
+                    Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
+                        if let Expr::Column(col) = &agg.args[0] {
+                            // Fetch temporal filter range and expr key which is used to identify a wheel
+                            let (range, expr_key) =
+                                match extract_filter_expr(&filter.predicate, &self.time_column)? {
                                     (range, Some(expr)) => {
                                         (range, maybe_replace_table_name(&expr, &self.name))
                                     }
                                     (range, None) => (range, STAR_AGGREGATION_ALIAS.to_string()),
                                 };
 
-                                // build the key for the wheel
-                                let wheel_key = format!("{}.{}.{}", self.name, col.name, expr_key);
+                            // build the key for the wheel
+                            let wheel_key = format!("{}.{}.{}", self.name, col.name, expr_key);
 
-                                let agg_type = func_def_to_aggregate_type(&agg.func_def)?;
-                                let schema = Arc::new(plan.schema().clone().as_arrow().clone());
-                                self.create_uwheel_plan(agg_type, &wheel_key, range, schema)
-                            } else {
-                                None
-                            }
+                            let agg_type = func_def_to_aggregate_type(&agg.func_def)?;
+                            let schema = Arc::new(plan.schema().clone().as_arrow().clone());
+                            self.create_uwheel_plan(agg_type, &wheel_key, range, schema)
+                        } else {
+                            None
                         }
-                        _ => None,
                     }
-                } else {
-                    None
+                    _ => None,
                 }
             }
             // Check whether it follows the pattern: SELECT * FROM X WHERE TIME >= X AND TIME <= Y
@@ -460,18 +471,18 @@ impl UWheelOptimizer {
     // Takes a wheel range and returns a plan-time aggregate result using a `TableScan(MemTable)`
     fn create_uwheel_plan(
         &self,
-        agg_type: AggregateType,
+        agg_type: UWheelAggregate,
         wheel_key: &str,
         range: WheelRange,
         schema: SchemaRef,
     ) -> Option<LogicalPlan> {
         match agg_type {
-            AggregateType::Sum => {
+            UWheelAggregate::Sum => {
                 let wheel = self.wheels.sum.lock().unwrap().get(wheel_key)?.clone();
                 let result = wheel.combine_range_and_lower(range)?;
                 uwheel_agg_to_table_scan(result, schema).ok()
             }
-            AggregateType::Avg => {
+            UWheelAggregate::Avg => {
                 let wheel = self.wheels.avg.lock().unwrap().get(wheel_key)?.clone();
                 let result = wheel
                     .combine_range_and_lower(range)
@@ -479,12 +490,12 @@ impl UWheelOptimizer {
 
                 uwheel_agg_to_table_scan(result, schema).ok()
             }
-            AggregateType::Min => {
+            UWheelAggregate::Min => {
                 let wheel = self.wheels.min.lock().unwrap().get(wheel_key)?.clone();
                 let result = wheel.combine_range_and_lower(range)?;
                 uwheel_agg_to_table_scan(result, schema).ok()
             }
-            AggregateType::Max => {
+            UWheelAggregate::Max => {
                 let wheel = self.wheels.max.lock().unwrap().get(wheel_key)?.clone();
                 let result = wheel.combine_range_and_lower(range)?;
                 uwheel_agg_to_table_scan(result, schema).ok()
@@ -556,18 +567,18 @@ fn empty_table_scan(
     LogicalPlanBuilder::scan(table_ref.into(), source, None)?.build()
 }
 
-fn func_def_to_aggregate_type(func_def: &AggregateFunctionDefinition) -> Option<AggregateType> {
+fn func_def_to_aggregate_type(func_def: &AggregateFunctionDefinition) -> Option<UWheelAggregate> {
     match func_def {
         AggregateFunctionDefinition::BuiltIn(datafusion::logical_expr::AggregateFunction::Max) => {
-            Some(AggregateType::Max)
+            Some(UWheelAggregate::Max)
         }
         AggregateFunctionDefinition::BuiltIn(datafusion::logical_expr::AggregateFunction::Min) => {
-            Some(AggregateType::Min)
+            Some(UWheelAggregate::Min)
         }
-        AggregateFunctionDefinition::UDF(udf) if udf.name() == "avg" => Some(AggregateType::Avg),
-        AggregateFunctionDefinition::UDF(udf) if udf.name() == "sum" => Some(AggregateType::Sum),
+        AggregateFunctionDefinition::UDF(udf) if udf.name() == "avg" => Some(UWheelAggregate::Avg),
+        AggregateFunctionDefinition::UDF(udf) if udf.name() == "sum" => Some(UWheelAggregate::Sum),
         AggregateFunctionDefinition::UDF(udf) if udf.name() == "count" => {
-            Some(AggregateType::Count)
+            Some(UWheelAggregate::Count)
         }
         _ => None,
     }
@@ -913,9 +924,11 @@ fn scalar_to_timestamp(scalar: &ScalarValue) -> Option<i64> {
             .map(|dt| dt.with_timezone(&Utc).timestamp_millis()),
         ScalarValue::TimestampMillisecond(Some(ms), _) => Some(*ms),
         ScalarValue::TimestampMicrosecond(Some(us), _) => Some(*us / 1000_i64),
-        ScalarValue::TimestampNanosecond(Some(ns), _) => {
-            Some(ns / 1_000_000) // Convert nanoseconds to milliseconds
-        }
+        ScalarValue::TimestampNanosecond(Some(ns), _) => Some(ns / 1_000_000),
+        ScalarValue::Date32(Some(days)) => NaiveDate::from_num_days_from_ce_opt(*days)
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|dt| dt.and_utc().timestamp_millis()),
+        ScalarValue::Date64(Some(ms)) => Some(*ms),
         _ => None,
     }
 }
@@ -1093,7 +1106,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Sum,
+                UWheelAggregate::Sum,
             ))
             .await?;
 
@@ -1126,7 +1139,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Min,
+                UWheelAggregate::Min,
             ))
             .await?;
 
@@ -1158,7 +1171,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Max,
+                UWheelAggregate::Max,
             ))
             .await?;
 
@@ -1190,7 +1203,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Avg,
+                UWheelAggregate::Avg,
             ))
             .await?;
 
@@ -1280,7 +1293,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Sum,
+                UWheelAggregate::Sum,
             ))
             .await?;
 
@@ -1326,7 +1339,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Min,
+                UWheelAggregate::Min,
             ))
             .await?;
 
@@ -1372,7 +1385,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Max,
+                UWheelAggregate::Max,
             ))
             .await?;
 
@@ -1418,7 +1431,7 @@ mod tests {
         optimizer
             .build_index(IndexBuilder::with_col_and_aggregate(
                 "agg_col",
-                AggregateType::Avg,
+                UWheelAggregate::Avg,
             ))
             .await?;
 

@@ -1,0 +1,13 @@
+[package]
+name = "nyc_taxi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+datafusion-uwheel.workspace = true
+tokio.workspace = true
+human_bytes.workspace = true

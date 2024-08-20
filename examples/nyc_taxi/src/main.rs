@@ -11,12 +11,12 @@ use datafusion::{
     prelude::{col, lit, SessionContext},
     scalar::ScalarValue,
 };
-use datafusion_uwheel::{builder::Builder, AggregateType, IndexBuilder, UWheelOptimizer};
+use datafusion_uwheel::{builder::Builder, IndexBuilder, UWheelAggregate, UWheelOptimizer};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let ctx = SessionContext::new();
-    let table_path = "../data/";
+    let table_path = "../../data/";
 
     // Parse the path
     let table_path = ListingTableUrl::parse(table_path)?;
@@ -48,12 +48,11 @@ async fn main() -> Result<()> {
             )?
             .with_min_max_wheels(vec!["fare_amount"])
             .build_with_provider(provider)
-            .await
-            .unwrap(),
+            .await?,
     );
 
     // Build a wheel SUM on fare_amount for certain days
-    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
+    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", UWheelAggregate::Sum)
         .with_time_range(
             ScalarValue::Utf8(Some("2022-01-01T00:00:00Z".to_string())),
             ScalarValue::Utf8(Some("2022-01-03T00:00:00Z".to_string())),
@@ -62,7 +61,7 @@ async fn main() -> Result<()> {
     optimizer.build_index(builder).await?;
 
     // Build a wheel for a custom expression
-    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", AggregateType::Sum)
+    let builder = IndexBuilder::with_col_and_aggregate("fare_amount", UWheelAggregate::Sum)
         .with_filter(col("passenger_count").eq(lit(ScalarValue::Float64(Some(4.0)))));
 
     optimizer.build_index(builder).await?;
@@ -145,7 +144,7 @@ async fn main() -> Result<()> {
     arrow::util::pretty::print_batches(&results).unwrap();
 
     println!(
-        "Index size usage: {}",
+        "Total Index bsize usage: {}",
         human_bytes::human_bytes(optimizer.index_usage_bytes() as u32)
     );
 
