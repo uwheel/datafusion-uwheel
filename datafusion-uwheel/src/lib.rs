@@ -51,103 +51,21 @@ use uwheel::{
 
 /// Custom aggregator implementations that are used by this crate.
 mod aggregator;
-/// Builder for creating a UWheelOptimizer
-pub mod builder;
 /// Various expressions that the optimizer supports
 mod expr;
+/// Supported Built-in wheels
+mod wheels;
 
+/// Builder for creating a UWheelOptimizer
+pub mod builder;
 /// Module containing util for creating wheel indices
 pub mod index;
 
 pub use index::{IndexBuilder, UWheelAggregate};
+use wheels::BuiltInWheels;
 
 const COUNT_STAR_ALIAS: &str = "count(*)";
 const STAR_AGGREGATION_ALIAS: &str = "*_AGG";
-
-type WheelMap<A> = Arc<Mutex<HashMap<String, ReaderWheel<A>>>>;
-
-#[derive(Clone)]
-struct BuiltInWheels {
-    /// A COUNT(*) wheel over the underlying table data and time column
-    pub count: ReaderWheel<U32SumAggregator>,
-    /// Min/Max pruning wheels for a specific column
-    pub min_max: WheelMap<F64MinMaxAggregator>,
-    /// SUM Aggregation Wheel Indices
-    pub sum: WheelMap<F64SumAggregator>,
-    /// AVG Aggregation Wheel Indices
-    pub avg: WheelMap<F64AvgAggregator>,
-    /// MAX Aggregation Wheel Indices
-    pub max: WheelMap<F64MaxAggregator>,
-    /// MIN Aggregation Wheel Indices
-    pub min: WheelMap<F64MinAggregator>,
-    /// ALL (SUM, AVG, MAX, MIN, COUNT) Aggregation Wheel Indices
-    pub all: WheelMap<AllAggregator>,
-}
-impl BuiltInWheels {
-    pub fn new(
-        count: ReaderWheel<U32SumAggregator>,
-        min_max_wheels: WheelMap<F64MinMaxAggregator>,
-    ) -> Self {
-        Self {
-            count,
-            min_max: min_max_wheels,
-            sum: Default::default(),
-            avg: Default::default(),
-            min: Default::default(),
-            max: Default::default(),
-            all: Default::default(),
-        }
-    }
-    /// Returns the total number of bytes used by all wheel indices
-    fn index_usage_bytes(&self) -> usize {
-        let mut bytes = 0;
-        bytes += self.count.as_ref().size_bytes();
-        bytes += self
-            .min_max
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, v)| v.as_ref().size_bytes())
-            .sum::<usize>();
-        bytes += self
-            .avg
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, v)| v.as_ref().size_bytes())
-            .sum::<usize>();
-        bytes += self
-            .sum
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, v)| v.as_ref().size_bytes())
-            .sum::<usize>();
-        bytes += self
-            .min
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, v)| v.as_ref().size_bytes())
-            .sum::<usize>();
-        bytes += self
-            .max
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, v)| v.as_ref().size_bytes())
-            .sum::<usize>();
-        bytes += self
-            .all
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, v)| v.as_ref().size_bytes())
-            .sum::<usize>();
-
-        bytes
-    }
-}
 
 /// A µWheel optimizer for DataFusion that indexes wheels for time-based analytical queries.
 ///
