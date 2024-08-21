@@ -241,7 +241,7 @@ impl UWheelOptimizer {
     /// This function takes a logical plan and checks whether it can be rewritten using `uwheel`
     ///
     /// Returns `Some(LogicalPlan)` with the rewritten plan, otherwise None.
-    pub(crate) fn try_rewrite(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
+    pub fn try_rewrite(&self, plan: &LogicalPlan) -> Option<LogicalPlan> {
         match plan {
             LogicalPlan::Filter(filter) => self.try_rewrite_filter(filter, plan),
             LogicalPlan::Projection(projection) => self.try_rewrite_projection(projection, plan),
