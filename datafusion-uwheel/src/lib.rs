@@ -402,9 +402,7 @@ impl UWheelOptimizer {
             }
             UWheelAggregate::Avg => {
                 let wheel = self.wheels.avg.lock().unwrap().get(wheel_key)?.clone();
-                let result = wheel
-                    .combine_range_and_lower(range)
-                    .map(F64AvgAggregator::lower)?; // # Replace when fixed: https://github.com/uwheel/uwheel/issues/140
+                let result = wheel.combine_range_and_lower(range)?;
 
                 uwheel_agg_to_table_scan(result, schema).ok()
             }

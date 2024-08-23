@@ -10,7 +10,7 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-uwheel = { version = "0.2.0", default-features = false, features = [
+uwheel = { version = "0.2.1", default-features = false, features = [
   "sync",
   "min_max",
   "sum",
