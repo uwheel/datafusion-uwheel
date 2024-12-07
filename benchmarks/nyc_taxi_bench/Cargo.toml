@@ -8,7 +8,7 @@ debug = []
 
 [dependencies]
 datafusion-uwheel = { path = "../../datafusion-uwheel" }
-datafusion = "40.0.0"
+datafusion = "43.0.0"
 mimalloc = { version = "*", default-features = false, optional = true }
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4.38"
