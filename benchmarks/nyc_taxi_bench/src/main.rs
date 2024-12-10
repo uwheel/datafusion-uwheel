@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use datafusion::common::ScalarValue;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::scalar::ScalarValue;
+use datafusion::execution::SessionStateBuilder;
 use datafusion_uwheel::{IndexBuilder, UWheelOptimizer};
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -119,9 +120,10 @@ async fn main() -> Result<()> {
         .await?;
 
     // Set UWheelOptimizer as optimizer rule
-    let session_state = uwheel_ctx
-        .state()
-        .with_optimizer_rules(vec![optimizer.clone()]);
+    let session_state = SessionStateBuilder::new()
+        .with_optimizer_rules(vec![optimizer.clone()])
+        .build();
+
     let uwheel_ctx = SessionContext::new_with_state(session_state);
 
     // Register the table using the underlying provider

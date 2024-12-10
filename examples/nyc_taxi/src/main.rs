@@ -7,6 +7,7 @@ use datafusion::{
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
     error::Result,
+    execution::SessionStateBuilder,
     physical_plan::collect,
     prelude::{col, lit, SessionContext},
     scalar::ScalarValue,
@@ -67,7 +68,10 @@ async fn main() -> Result<()> {
     optimizer.build_index(builder).await?;
 
     // Set UWheelOptimizer as the query planner
-    let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+    let session_state = SessionStateBuilder::new()
+        .with_optimizer_rules(vec![optimizer.clone()])
+        .build();
+
     let ctx = SessionContext::new_with_state(session_state);
 
     // Register the table using the underlying provider

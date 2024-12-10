@@ -7,6 +7,7 @@ use chrono::Utc;
 use datafusion::arrow::array::{Float64Array, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
 use datafusion::datasource::MemTable;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::{
     arrow::{
         array::{Int64Array, RecordBatch},
@@ -37,7 +38,10 @@ async fn main() -> Result<()> {
     ctx.register_table("my_table", optimizer.provider().clone())?;
 
     // Set UWheelOptimizer as optimizer rule
-    let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+    let session_state = SessionStateBuilder::new()
+        .with_optimizer_rules(vec![optimizer.clone()])
+        .build();
+
     let ctx = SessionContext::new_with_state(session_state);
 
     // Create a Temporal COUNT(*) Aggregation Query

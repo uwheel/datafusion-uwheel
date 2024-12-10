@@ -7,10 +7,13 @@
 
 use std::{
     collections::HashMap,
+    fmt::Debug,
     sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, NaiveDate, Utc};
+use datafusion::error::Result;
+use datafusion::prelude::*;
 use datafusion::{
     arrow::{
         array::{
@@ -24,15 +27,13 @@ use datafusion::{
     datasource::{provider_as_source, MemTable, TableProvider},
     error::DataFusionError,
     logical_expr::{
-        expr::AggregateFunctionDefinition, Aggregate, Filter, LogicalPlan, LogicalPlanBuilder,
+        expr::AggregateFunction, Aggregate, AggregateUDF, Filter, LogicalPlan, LogicalPlanBuilder,
         Operator, Projection, TableScan,
     },
     optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule},
-    prelude::*,
     scalar::ScalarValue,
     sql::TableReference,
 };
-use datafusion::{error::Result, logical_expr::expr::AggregateFunction};
 use expr::{
     extract_filter_expr, extract_uwheel_expr, extract_wheel_range, MinMaxFilter, UWheelExpr,
 };
@@ -303,7 +304,7 @@ impl UWheelOptimizer {
                             // build the key for the wheel
                             let wheel_key = format!("{}.{}.{}", self.name, col.name, expr_key);
 
-                            let agg_type = func_def_to_aggregate_type(&agg.func_def)?;
+                            let agg_type = func_def_to_aggregate_type(&agg.func)?;
                             let schema = Arc::new(plan.schema().clone().as_arrow().clone());
                             self.create_uwheel_plan(agg_type, &wheel_key, range, schema)
                         } else {
@@ -483,20 +484,20 @@ fn empty_table_scan(
     LogicalPlanBuilder::scan(table_ref.into(), source, None)?.build()
 }
 
-fn func_def_to_aggregate_type(func_def: &AggregateFunctionDefinition) -> Option<UWheelAggregate> {
-    match func_def {
-        AggregateFunctionDefinition::BuiltIn(datafusion::logical_expr::AggregateFunction::Max) => {
-            Some(UWheelAggregate::Max)
-        }
-        AggregateFunctionDefinition::BuiltIn(datafusion::logical_expr::AggregateFunction::Min) => {
-            Some(UWheelAggregate::Min)
-        }
-        AggregateFunctionDefinition::UDF(udf) if udf.name() == "avg" => Some(UWheelAggregate::Avg),
-        AggregateFunctionDefinition::UDF(udf) if udf.name() == "sum" => Some(UWheelAggregate::Sum),
-        AggregateFunctionDefinition::UDF(udf) if udf.name() == "count" => {
-            Some(UWheelAggregate::Count)
-        }
+fn func_def_to_aggregate_type(func_def: &Arc<AggregateUDF>) -> Option<UWheelAggregate> {
+    match func_def.name() {
+        "max" => Some(UWheelAggregate::Max),
+        "min" => Some(UWheelAggregate::Min),
+        "avg" => Some(UWheelAggregate::Avg),
+        "sum" => Some(UWheelAggregate::Sum),
+        "count" => Some(UWheelAggregate::Count),
         _ => None,
+    }
+}
+
+impl Debug for UWheelOptimizer {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
     }
 }
 
@@ -541,7 +542,13 @@ fn mem_table_as_table_scan(table: MemTable, original_schema: DFSchemaRef) -> Res
 }
 
 fn is_wildcard(expr: &Expr) -> bool {
-    matches!(expr, Expr::Wildcard { qualifier: None })
+    matches!(
+        expr,
+        Expr::Wildcard {
+            qualifier: None,
+            ..
+        }
+    )
 }
 
 /// Determines if the given aggregate function is a COUNT(*) aggregate.
@@ -558,10 +565,10 @@ fn is_wildcard(expr: &Expr) -> bool {
 fn is_count_star_aggregate(aggregate_function: &AggregateFunction) -> bool {
     matches!(aggregate_function,
         AggregateFunction {
-            func_def,
+            func,
             args,
             ..
-        } if func_def.name() == "COUNT" && (args.len() == 1 && is_wildcard(&args[0]) || args.is_empty()))
+        } if func.name() == "COUNT" && (args.len() == 1 && is_wildcard(&args[0]) || args.is_empty()))
 }
 
 // Helper methods to build the UWheelOptimizer
@@ -934,7 +941,9 @@ mod tests {
     use chrono::Duration;
     use chrono::TimeZone;
     use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
+    use datafusion::execution::SessionStateBuilder;
     use datafusion::functions_aggregate::expr_fn::avg;
+    use datafusion::functions_aggregate::min_max::{max, min};
     use datafusion::logical_expr::test::function_stub::{count, sum};
 
     use super::*;
@@ -1182,7 +1191,9 @@ mod tests {
         ctx.register_table("test", optimizer.provider().clone())?;
 
         // Set UWheelOptimizer as optimizer rule
-        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let session_state = SessionStateBuilder::new()
+            .with_optimizer_rules(vec![optimizer.clone()])
+            .build();
         let uwheel_ctx = SessionContext::new_with_state(session_state);
 
         // Run the query through the ctx that has our OptimizerRule
@@ -1228,7 +1239,9 @@ mod tests {
         ctx.register_table("test", optimizer.provider().clone())?;
 
         // Set UWheelOptimizer as optimizer rule
-        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let session_state = SessionStateBuilder::new()
+            .with_optimizer_rules(vec![optimizer.clone()])
+            .build();
         let uwheel_ctx = SessionContext::new_with_state(session_state);
 
         // Run the query through the ctx that has our OptimizerRule
@@ -1274,7 +1287,9 @@ mod tests {
         ctx.register_table("test", optimizer.provider().clone())?;
 
         // Set UWheelOptimizer as optimizer rule
-        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let session_state = SessionStateBuilder::new()
+            .with_optimizer_rules(vec![optimizer.clone()])
+            .build();
         let uwheel_ctx = SessionContext::new_with_state(session_state);
 
         // Run the query through the ctx that has our OptimizerRule
@@ -1320,7 +1335,9 @@ mod tests {
         ctx.register_table("test", optimizer.provider().clone())?;
 
         // Set UWheelOptimizer as optimizer rule
-        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let session_state = SessionStateBuilder::new()
+            .with_optimizer_rules(vec![optimizer.clone()])
+            .build();
         let uwheel_ctx = SessionContext::new_with_state(session_state);
 
         // Run the query through the ctx that has our OptimizerRule
@@ -1366,7 +1383,9 @@ mod tests {
         ctx.register_table("test", optimizer.provider().clone())?;
 
         // Set UWheelOptimizer as optimizer rule
-        let session_state = ctx.state().with_optimizer_rules(vec![optimizer.clone()]);
+        let session_state = SessionStateBuilder::new()
+            .with_optimizer_rules(vec![optimizer.clone()])
+            .build();
         let uwheel_ctx = SessionContext::new_with_state(session_state);
 
         // Run the query through the ctx that has our OptimizerRule
