@@ -3,7 +3,7 @@ resolver = "2"
 members = ["benchmarks/nyc_taxi_bench", "datafusion-uwheel", "examples/*"]
 
 [workspace.package]
-version = "40.0.0"
+version = "46.0.0"
 edition = "2021"
 authors = ["Max Meldrum <max@meldrum.se>"]
 license = "Apache-2.0"
