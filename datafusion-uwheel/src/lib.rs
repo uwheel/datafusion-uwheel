@@ -13,6 +13,7 @@ use std::{
 
 use chrono::{DateTime, NaiveDate, Utc};
 use datafusion::error::Result;
+use datafusion::logical_expr::expr::AggregateFunctionParams;
 use datafusion::prelude::*;
 use datafusion::{
     arrow::{
@@ -304,8 +305,8 @@ impl UWheelOptimizer {
                         self.try_count_rewrite(filter, plan)
                     }
                     // Single Aggregate Function (e.g., SUM(col))
-                    Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
-                        if let Expr::Column(col) = &agg.args[0] {
+                    Expr::AggregateFunction(agg) if agg.params.args.len() == 1 => {
+                        if let Expr::Column(col) = &agg.params.args[0] {
                             // Fetch temporal filter range and expr key which is used to identify a wheel
                             let (range, expr_key) =
                                 match extract_filter_expr(&filter.predicate, &self.time_column)? {
@@ -376,10 +377,10 @@ impl UWheelOptimizer {
                                     }
 
                                     Expr::AggregateFunction(agg) => {
-                                        if agg.args.len() > 1 {
+                                        if agg.params.args.len() > 1 {
                                             return None;
                                         }
-                                        let col = match &agg.args[0] {
+                                        let col = match &agg.params.args[0] {
                                             Expr::Column(col) => col,
                                             _ => return None,
                                         };
@@ -512,8 +513,8 @@ impl UWheelOptimizer {
                 for agg_expr in agg_exprs {
                     match agg_expr {
                         // Single Aggregate Function (e.g., SUM(col))
-                        Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
-                            if let Expr::Column(col) = &agg.args[0] {
+                        Expr::AggregateFunction(agg) if agg.params.args.len() == 1 => {
+                            if let Expr::Column(col) = &agg.params.args[0] {
                                 // Fetch temporal filter range and expr key which is used to identify a wheel
                                 let (range, expr_key) = match extract_filter_expr(
                                     &filter.predicate,
@@ -554,8 +555,8 @@ impl UWheelOptimizer {
                 let agg_expr = agg.aggr_expr.first().unwrap();
                 match agg_expr {
                     // Single Aggregate Function (e.g., SUM(col))
-                    Expr::AggregateFunction(agg) if agg.args.len() == 1 => {
-                        if let Expr::Column(col) = &agg.args[0] {
+                    Expr::AggregateFunction(agg) if agg.params.args.len() == 1 => {
+                        if let Expr::Column(col) = &agg.params.args[0] {
                             // build the key for the wheel
                             let wheel_key =
                                 format!("{}.{}.{}", self.name, col.name, STAR_AGGREGATION_ALIAS);
@@ -904,8 +905,10 @@ fn is_count_star_aggregate(aggregate_function: &AggregateFunction) -> bool {
     matches!(aggregate_function,
         AggregateFunction {
             func,
-            args,
-            ..
+            params: AggregateFunctionParams {
+                args,
+                ..
+            }
         } if (func.name() == "COUNT" || func.name() == "count") && (args.len() == 1 && is_wildcard(&args[0]) || args.is_empty()))
 }
 
