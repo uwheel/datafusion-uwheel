@@ -12,7 +12,6 @@ use std::{
 };
 
 use chrono::{DateTime, NaiveDate, Utc};
-use datafusion::error::Result;
 use datafusion::logical_expr::expr::AggregateFunctionParams;
 use datafusion::prelude::*;
 use datafusion::{
@@ -35,6 +34,7 @@ use datafusion::{
     scalar::ScalarValue,
     sql::TableReference,
 };
+use datafusion::{error::Result, logical_expr::utils::COUNT_STAR_EXPANSION};
 use expr::{
     extract_filter_expr, extract_uwheel_expr, extract_wheel_range, MinMaxFilter, UWheelExpr,
 };
@@ -880,14 +880,8 @@ fn mem_table_as_table_scan(table: MemTable, original_schema: DFSchemaRef) -> Res
     Ok(LogicalPlan::TableScan(table_scan))
 }
 
-fn is_wildcard(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Wildcard {
-            qualifier: None,
-            ..
-        }
-    )
+fn is_count_star(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(val) if *val == COUNT_STAR_EXPANSION)
 }
 
 /// Determines if the given aggregate function is a COUNT(*) aggregate.
@@ -909,7 +903,7 @@ fn is_count_star_aggregate(aggregate_function: &AggregateFunction) -> bool {
                 args,
                 ..
             }
-        } if (func.name() == "COUNT" || func.name() == "count") && (args.len() == 1 && is_wildcard(&args[0]) || args.is_empty()))
+        } if (func.name() == "COUNT" || func.name() == "count") && (args.len() == 1 && is_count_star(&args[0]) || args.is_empty()))
 }
 
 // Helper methods to build the UWheelOptimizer
@@ -1287,6 +1281,7 @@ mod tests {
     use datafusion::functions_aggregate::expr_fn::avg;
     use datafusion::functions_aggregate::min_max::{max, min};
     use datafusion::functions_aggregate::sum::sum;
+    use datafusion::logical_expr::utils::COUNT_STAR_EXPANSION;
     use datafusion::prelude::date_trunc;
 
     use super::*;
@@ -1352,8 +1347,11 @@ mod tests {
         let plan =
             LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
                 .filter(temporal_filter)?
-                .aggregate(Vec::<Expr>::new(), vec![count(wildcard())])?
-                .project(vec![count(wildcard())])?
+                .aggregate(
+                    Vec::<Expr>::new(),
+                    vec![count(Expr::Literal(COUNT_STAR_EXPANSION))],
+                )?
+                .project(vec![count(Expr::Literal(COUNT_STAR_EXPANSION))])?
                 .build()?;
 
         // Assert that the original plan is a Projection
@@ -1507,8 +1505,11 @@ mod tests {
         let plan =
             LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
                 .filter(temporal_filter)?
-                .aggregate(Vec::<Expr>::new(), vec![count(wildcard())])?
-                .project(vec![count(wildcard())])?
+                .aggregate(
+                    Vec::<Expr>::new(),
+                    vec![count(Expr::Literal(COUNT_STAR_EXPANSION))],
+                )?
+                .project(vec![count(Expr::Literal(COUNT_STAR_EXPANSION))])?
                 .build()?;
 
         assert!(optimizer.try_rewrite(&plan).is_none());
@@ -1526,8 +1527,11 @@ mod tests {
         let plan =
             LogicalPlanBuilder::scan("test", provider_as_source(optimizer.provider()), None)?
                 .filter(temporal_filter)?
-                .aggregate(Vec::<Expr>::new(), vec![count(wildcard())])?
-                .project(vec![count(wildcard())])?
+                .aggregate(
+                    Vec::<Expr>::new(),
+                    vec![count(Expr::Literal(COUNT_STAR_EXPANSION))],
+                )?
+                .project(vec![count(Expr::Literal(COUNT_STAR_EXPANSION))])?
                 .build()?;
 
         let ctx = SessionContext::new();
@@ -1762,11 +1766,11 @@ mod tests {
                 .filter(temporal_filter)?
                 .aggregate(
                     vec![date_trunc(lit("day"), col("timestamp"))], // GROUP BY date_trunc('day', timestamp)
-                    vec![count(wildcard())],
+                    vec![count(Expr::Literal(COUNT_STAR_EXPANSION))],
                 )?
                 .project(vec![
                     date_trunc(lit("day"), col("timestamp")),
-                    count(wildcard()),
+                    count(Expr::Literal(COUNT_STAR_EXPANSION)),
                 ])?
                 .build()?;
 
@@ -1793,11 +1797,11 @@ mod tests {
                 .filter(temporal_filter)?
                 .aggregate(
                     vec![date_trunc(lit("day"), col("timestamp"))], // GROUP BY date_trunc('day', timestamp)
-                    vec![count(wildcard())],
+                    vec![count(Expr::Literal(COUNT_STAR_EXPANSION))],
                 )?
                 .project(vec![
                     date_trunc(lit("day"), col("timestamp")),
-                    count(wildcard()),
+                    count(Expr::Literal(COUNT_STAR_EXPANSION)),
                 ])?
                 .build()?;
 
@@ -2051,13 +2055,17 @@ mod tests {
                 .filter(temporal_filter)?
                 .aggregate(
                     vec![date_trunc(lit("day"), col("timestamp"))], // GROUP BY date_trunc('day', timestamp)
-                    vec![sum(col("agg_col")), avg(col("agg_col")), count(wildcard())],
+                    vec![
+                        sum(col("agg_col")),
+                        avg(col("agg_col")),
+                        count(Expr::Literal(COUNT_STAR_EXPANSION)),
+                    ],
                 )?
                 .project(vec![
                     date_trunc(lit("day"), col("timestamp")),
                     sum(col("agg_col")),
                     avg(col("agg_col")),
-                    count(wildcard()),
+                    count(Expr::Literal(COUNT_STAR_EXPANSION)),
                 ])?
                 .build()?;
 
@@ -2098,13 +2106,17 @@ mod tests {
                 .filter(temporal_filter)?
                 .aggregate(
                     vec![date_trunc(lit("day"), col("timestamp"))], // GROUP BY date_trunc('day', timestamp)
-                    vec![sum(col("agg_col")), avg(col("agg_col")), count(wildcard())],
+                    vec![
+                        sum(col("agg_col")),
+                        avg(col("agg_col")),
+                        count(Expr::Literal(COUNT_STAR_EXPANSION)),
+                    ],
                 )?
                 .project(vec![
                     date_trunc(lit("day"), col("timestamp")),
                     sum(col("agg_col")),
                     avg(col("agg_col")),
-                    count(wildcard()),
+                    count(Expr::Literal(COUNT_STAR_EXPANSION)),
                 ])?
                 .build()?;
 
